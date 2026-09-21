@@ -17,6 +17,19 @@ from app.video.composer import create_motion_clip
 
 
 RUNWAY_VERSION = "2024-11-06"
+RUNWAY_PROMPT_MAX_CHARS = 1000
+
+
+def _fit_runway_prompt(prompt: str) -> str:
+    """Fit promptText to Runway's documented 1,000-character limit."""
+    normalized = " ".join(prompt.split())
+    if len(normalized) <= RUNWAY_PROMPT_MAX_CHARS:
+        return normalized
+
+    # Prefer a clean word boundary. The caller should put the most
+    # important visual instructions before optional explanatory prose.
+    compact = normalized[: RUNWAY_PROMPT_MAX_CHARS - 3].rsplit(" ", 1)[0]
+    return f"{compact}..."
 
 
 def _image_data_uri(image_path: Path) -> str:
@@ -68,6 +81,7 @@ def _generate_with_runway(
     duration_seconds: int,
 ) -> str:
     requested_duration = 10 if duration_seconds >= 10 else 5
+    prompt = _fit_runway_prompt(prompt)
     payload = {
         "model": RUNWAY_MODEL,
         "promptImage": _image_data_uri(image),

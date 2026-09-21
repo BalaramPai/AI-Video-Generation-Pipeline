@@ -139,7 +139,7 @@ def repair_storyboard_continuity(data: dict) -> None:
     scenes = data.get("scenes", [])
 
     for index, scene in enumerate(scenes):
-        continuity = scene["continuity"]
+        continuity = scene.setdefault("continuity", {})
         visual_description = scene.get("visual_description", "")
         action = scene.get("action", "")
 
@@ -177,6 +177,13 @@ def repair_storyboard_continuity(data: dict) -> None:
                 visual_description or action
             )
 
+        # Optional detail fields are still made explicit in the persisted
+        # storyboard so downstream prompt builders have a stable shape.
+        scene.setdefault("blocking", "")
+        scene.setdefault("shot_intent", "")
+        scene.setdefault("visual_continuity", "")
+        scene.setdefault("negative_prompt", "")
+
 def validate_storyboard_continuity(storyboard: Storyboard) -> None:
 
     scenes = storyboard.scenes
@@ -185,6 +192,8 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
         raise ValueError("Storyboard must contain at least one scene.")
 
     scene_ids = {scene.id for scene in scenes}
+    if len(scene_ids) != len(scenes):
+        raise ValueError("Scene IDs must be unique.")
 
     location_ids = {
         location.id
@@ -200,6 +209,13 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
         prop.id
         for prop in storyboard.props
     }
+
+    if len(location_ids) != len(storyboard.locations):
+        raise ValueError("Location IDs must be unique.")
+    if len(character_ids) != len(storyboard.characters):
+        raise ValueError("Character IDs must be unique.")
+    if len(prop_ids) != len(storyboard.props):
+        raise ValueError("Prop IDs must be unique.")
 
     for index, scene in enumerate(scenes):
 
@@ -239,6 +255,15 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
             raise ValueError(
                 f"{scene.id} references unknown location "
                 f"{scene.location_id}."
+            )
+
+        if len(scene.character_ids) != len(set(scene.character_ids)):
+            raise ValueError(
+                f"{scene.id} contains duplicate character IDs."
+            )
+        if len(scene.prop_ids) != len(set(scene.prop_ids)):
+            raise ValueError(
+                f"{scene.id} contains duplicate prop IDs."
             )
 
         # ---------------------------------------------
@@ -351,10 +376,3 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
             raise ValueError(
                 f"{scene.id} must have a real environment_state."
             )
-
-    # ---------------------------------------------
-    # UNIQUE SCENE IDS
-    # ---------------------------------------------
-
-    if len(scene_ids) != len(scenes):
-        raise ValueError("Scene IDs must be unique.")

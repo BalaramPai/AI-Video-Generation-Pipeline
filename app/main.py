@@ -17,6 +17,54 @@ from app.video.generator import generate_scene_video
 OUTPUT_DIR = Path("outputs")
 
 
+def _build_motion_prompt(storyboard, scene) -> str:
+    location = next(
+        location for location in storyboard.locations
+        if location.id == scene.location_id
+    )
+    characters = [
+        character for character in storyboard.characters
+        if character.id in scene.character_ids
+    ]
+    character_lock = "; ".join(
+        (
+            f"{character.name}: age {character.appearance.age}, "
+            f"{character.appearance.hair}, "
+            f"{character.appearance.facial_features}, "
+            f"{character.appearance.clothing}"
+        )
+        for character in characters
+    )
+    prop_lock = ", ".join(
+        ", ".join(
+            detail for detail in
+            (prop.description, prop.continuity_anchor) if detail
+        )
+        for prop in storyboard.props
+        if prop.id in scene.prop_ids
+    )
+    negative = scene.negative_prompt or (
+        "No identity changes, face morphing, duplicate people, extra limbs, "
+        "warped hands, costume changes, prop teleportation, text, logos, "
+        "flicker, melting objects, or sudden camera cuts."
+    )
+    return (
+        f"Continuous {scene.duration_seconds}s shot. "
+        f"Location: {location.name}; light: {location.lighting}. "
+        f"Identity lock: {character_lock}. "
+        f"Props: {prop_lock or 'none'}. "
+        f"Start: {scene.continuity.required_start_state}. "
+        f"Blocking: {scene.blocking}. "
+        f"Action: {scene.action}. "
+        f"End: {scene.continuity.ending_state}. "
+        f"Camera: {scene.camera.shot_type}, {scene.camera.angle}, "
+        f"{scene.camera.movement}, {scene.camera.lens or 'natural lens'}. "
+        f"Preserve faces, proportions, wardrobe, lighting, composition, "
+        f"and prop positions; animate only this action naturally. "
+        f"Avoid: {negative}"
+    )
+
+
 def main():
     idea = input("\nEnter your video idea:\n> ").strip()
 
@@ -66,6 +114,7 @@ def main():
             generate_scene_image(
                 prompt=image_prompt,
                 output_path=str(image_path),
+                negative_prompt=scene.negative_prompt,
             )
         else:
             if previous_video is None:
@@ -93,15 +142,7 @@ def main():
                 output_path=str(image_path),
             )
 
-        motion_prompt = (
-            f"{scene.action}. "
-            f"{scene.visual_description} "
-            f"Natural realistic movement, continuous action, "
-            f"{scene.camera.movement}, {scene.camera.shot_type}, "
-            f"{scene.camera.angle}. "
-            "Keep the characters, clothing, location, lighting, and props "
-            "consistent with the input image."
-        )
+        motion_prompt = _build_motion_prompt(storyboard, scene)
         previous_video = generate_scene_video(
             image_path=str(image_path),
             prompt=motion_prompt,

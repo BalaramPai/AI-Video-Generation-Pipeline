@@ -44,6 +44,30 @@ Runway generates actual motion from each scene image using the scene action,
 visual description, camera movement, and continuity instructions. The final
 video is assembled only after all scene clips have been generated.
 
+## Continuity and artifact controls
+
+The storyboard is a production contract, not just a scene list. Each
+character can carry immutable eye color, distinctive-feature, and wardrobe
+anchors; each location and prop can carry a visual continuity anchor; and each
+scene can specify blocking, shot intent, visual continuity, and a negative
+prompt. The storyboard prompt instructs Ollama to keep these facts stable and
+the validator rejects broken scene references, duplicate IDs, and duplicate
+character or prop assignments.
+
+Image prompts include every character in the scene, the scene action, and the
+camera framing. They are compacted against the Stable Diffusion 1.5 CLIP
+limit instead of being silently truncated. Continuation images use the last
+frame as an img2img reference with a low denoise strength so identity and
+composition are preserved rather than redrawn. Generated motion prompts
+repeat the start state, blocking, prop state, and end state and explicitly
+exclude identity morphing, extra limbs, duplicate people, costume changes,
+prop teleportation, flicker, and sudden cuts.
+
+These controls reduce, but cannot mathematically eliminate, artifacts from
+the underlying image-to-video model. For the most reliable results, keep
+each scene to one primary action, one camera movement, and a small number of
+characters and interacting props.
+
 ## Local fallback
 
 If no hosted video provider is available, set:

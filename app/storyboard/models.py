@@ -96,12 +96,16 @@ class CharacterAppearance(BaseModel):
     clothing: str
     facial_features: str
     physical_description: str
+    eye_color: str = ""
+    distinctive_features: str = ""
+    wardrobe_anchor: str = ""
 
 
 class Character(BaseModel):
     id: str
     name: str
     appearance: CharacterAppearance
+    role: str = ""
 
 
 class Location(BaseModel):
@@ -110,12 +114,14 @@ class Location(BaseModel):
     description: str
     lighting: str
     visual_style: str
+    continuity_anchor: str = ""
 
 
 class Prop(BaseModel):
     id: str
     name: str
     description: str
+    continuity_anchor: str = ""
 
 
 class Camera(BaseModel):
@@ -147,6 +153,10 @@ class Scene(BaseModel):
 
     camera: Camera
     continuity: Continuity
+    blocking: str = ""
+    shot_intent: str = ""
+    visual_continuity: str = ""
+    negative_prompt: str = ""
 
 
 class Storyboard(BaseModel):

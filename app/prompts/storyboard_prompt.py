@@ -119,6 +119,10 @@ For every character provide:
 - clothing
 - facial features
 - physical description
+- eye color
+- two or three distinctive, immutable features
+- a short wardrobe anchor that must be copied verbatim in every scene
+- narrative role
 
 Do not use vague descriptions such as:
 
@@ -138,6 +142,11 @@ and white sneakers."
 The same character description must remain consistent across
 all scenes.
 
+Never make two characters visually interchangeable. Give each one a
+different age range, silhouette, hair, face shape, eye color, clothing
+palette, and distinctive feature. Do not use pronouns when a named
+character can be used.
+
 ==================================================
 LOCATION REQUIREMENTS
 ==================================================
@@ -155,6 +164,7 @@ Describe:
 - important background elements
 - lighting
 - overall visual style
+- a concise continuity_anchor containing the details that must not drift
 
 Do not randomly change the environment between scenes.
 
@@ -164,6 +174,10 @@ PROP REQUIREMENTS
 
 Important objects that appear in a scene must be explicitly listed
 in the scene's prop_ids.
+
+Every important prop must have a continuity_anchor describing its exact
+color, material, shape, and state. Track who holds, wears, opens, closes,
+or moves it. Never teleport, duplicate, or silently change a prop.
 
 Do not describe an important prop in visual_description while
 omitting it from prop_ids.
@@ -186,6 +200,22 @@ Each scene must define:
 
 The visual_description must describe what should actually be visible
 in the generated video.
+
+Also provide:
+
+- blocking: named character positions, facing direction, hand occupancy,
+  and the single readable action beat
+- shot_intent: the visual purpose of the shot
+- visual_continuity: immutable identity, wardrobe, location, lighting,
+  and prop details to preserve
+- negative_prompt: concrete artifacts to avoid (extra people/limbs,
+  duplicate faces, text, logos, warped hands, melting objects, identity
+  changes, costume changes, teleporting)
+
+Keep each scene to one primary action and one camera movement. Avoid
+complex crowds, rapid choreography, hand-to-hand exchanges, reflections,
+and abrupt camera changes because they increase generation artifacts.
+Prefer a stable 5–10 second shot with a clear beginning and end.
 
 ==================================================
 CONTINUITY REQUIREMENTS
@@ -248,6 +278,12 @@ Scene N+1 required_start_state
 The states should match or logically continue.
 
 Do not introduce unexplained changes.
+
+For each transition, carry forward exact physical facts: character
+position and facing, hands and props, wardrobe, time of day, weather,
+lighting direction, and damaged/open/closed states. The next scene's
+required_start_state must repeat those facts in plain language, not
+refer to a symbolic field.
 
 ==================================================
 CHARACTER PRESENCE
