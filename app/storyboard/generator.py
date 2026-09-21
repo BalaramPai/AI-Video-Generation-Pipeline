@@ -73,6 +73,7 @@
 
 
 import json
+import re
 
 import ollama
 
@@ -82,24 +83,29 @@ from app.storyboard.models import Storyboard
 
 
 def generate_storyboard(idea: str) -> Storyboard:
-
-    response = ollama.chat(
-        model=OLLAMA_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": STORYBOARD_SYSTEM_PROMPT,
+    try:
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": STORYBOARD_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": idea,
+                },
+            ],
+            format=Storyboard.model_json_schema(),
+            options={
+                "temperature": 0.2,
             },
-            {
-                "role": "user",
-                "content": idea,
-            },
-        ],
-        format=Storyboard.model_json_schema(),
-        options={
-            "temperature": 0.2,
-        },
-    )
+        )
+    except (ConnectionError, ollama.ResponseError) as exc:
+        raise RuntimeError(
+            "Ollama is not available. Start the Ollama application, then "
+            f"run `ollama pull {OLLAMA_MODEL}` before retrying."
+        ) from exc
 
     raw_content = response["message"]["content"]
 
@@ -115,17 +121,7 @@ def generate_storyboard(idea: str) -> Storyboard:
     # REPAIR DETERMINISTIC CONTINUITY FIELDS
     # --------------------------------------------------
 
-    scenes = data.get("scenes", [])
-
-    for index, scene in enumerate(scenes):
-
-        if index == 0:
-            scene["continuity"]["previous_scene_id"] = None
-
-        else:
-            scene["continuity"]["previous_scene_id"] = scenes[
-                index - 1
-            ]["id"]
+    repair_storyboard_continuity(data)
 
     # --------------------------------------------------
     # VALIDATE WITH PYDANTIC
@@ -137,6 +133,49 @@ def generate_storyboard(idea: str) -> Storyboard:
 
     return storyboard
 
+
+def repair_storyboard_continuity(data: dict) -> None:
+    """Normalize deterministic continuity fields returned by the LLM."""
+    scenes = data.get("scenes", [])
+
+    for index, scene in enumerate(scenes):
+        continuity = scene["continuity"]
+        visual_description = scene.get("visual_description", "")
+        action = scene.get("action", "")
+
+        if index == 0:
+            continuity["previous_scene_id"] = None
+        else:
+            previous_scene = scenes[index - 1]
+            previous_scene_id = previous_scene["id"]
+            continuity["previous_scene_id"] = previous_scene_id
+
+            required_start = continuity.get("required_start_state") or ""
+            symbolic_state = re.fullmatch(
+                r"(?:previous_scene|" + re.escape(previous_scene_id)
+                + r")\.ending_state",
+                required_start.strip(),
+                flags=re.IGNORECASE,
+            )
+
+            if symbolic_state:
+                continuity["required_start_state"] = (
+                    previous_scene["continuity"]["ending_state"]
+                )
+
+        ending_state = continuity.get("ending_state")
+        if ending_state is None or str(ending_state).strip().lower() in {
+            "",
+            "null",
+            "none",
+        }:
+            continuity["required_start_state"] = (
+                continuity.get("required_start_state")
+                or action
+            )
+            continuity["ending_state"] = (
+                visual_description or action
+            )
 
 def validate_storyboard_continuity(storyboard: Storyboard) -> None:
 

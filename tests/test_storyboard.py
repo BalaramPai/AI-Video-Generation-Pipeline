@@ -1,3 +1,7 @@
+from app.storyboard.generator import (
+    repair_storyboard_continuity,
+    validate_storyboard_continuity,
+)
 from app.storyboard.models import Storyboard
 
 
@@ -73,3 +77,64 @@ def test_storyboard_model():
     assert storyboard.project.title == "Coffee Shop"
     assert len(storyboard.scenes) == 1
     assert storyboard.scenes[0].id == "SCENE_001"
+
+
+def test_symbolic_required_start_state_is_repaired():
+    data = {
+        "scenes": [
+            {
+                "id": "SCENE_001",
+                "continuity": {
+                    "previous_scene_id": "wrong",
+                    "required_start_state": "outside",
+                    "ending_state": "standing at the counter",
+                },
+            },
+            {
+                "id": "SCENE_002",
+                "continuity": {
+                    "previous_scene_id": None,
+                    "required_start_state": "SCENE_001.ending_state",
+                    "ending_state": "holding a coffee",
+                },
+            },
+        ]
+    }
+
+    repair_storyboard_continuity(data)
+
+    assert data["scenes"][0]["continuity"]["previous_scene_id"] is None
+    assert (
+        data["scenes"][1]["continuity"]["previous_scene_id"]
+        == "SCENE_001"
+    )
+    assert (
+        data["scenes"][1]["continuity"]["required_start_state"]
+        == "standing at the counter"
+    )
+
+
+def test_missing_ending_state_is_repaired_from_scene_description():
+    data = {
+        "scenes": [
+            {
+                "id": "SCENE_001",
+                "action": "The man sits by the window.",
+                "visual_description": (
+                    "The man is seated at a window table with his coffee."
+                ),
+                "continuity": {
+                    "previous_scene_id": None,
+                    "required_start_state": "outside",
+                    "ending_state": None,
+                },
+            }
+        ]
+    }
+
+    repair_storyboard_continuity(data)
+
+    assert (
+        data["scenes"][0]["continuity"]["ending_state"]
+        == "The man is seated at a window table with his coffee."
+    )
