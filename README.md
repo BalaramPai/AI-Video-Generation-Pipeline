@@ -69,6 +69,14 @@ idea to have the storyboard target that exact length. Longer projects are
 made from more scenes and concatenated; there is no single-task long-video
 limit in the pipeline.
 
+Before joining, each scene is normalized to the measured frame rate of the
+first generated clip and to a calculated frame count. Fractional frame
+boundaries use exact rational arithmetic and round to the nearest frame, with
+half-frame ties rounded up; each scene receives the difference between its
+rounded cumulative end and start boundaries. The final clip is checked against
+the sum of those scene frame counts, avoiding per-scene rounding drift and
+unnecessary re-encoding during concatenation.
+
 ## Continuity and artifact controls
 
 The storyboard is a production contract, not just a scene list. Each

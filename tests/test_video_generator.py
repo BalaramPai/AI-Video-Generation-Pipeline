@@ -1,4 +1,4 @@
-from pathlib import Path
+from fractions import Fraction
 
 import pytest
 
@@ -171,13 +171,29 @@ def test_generate_scene_video_normalizes_provider_duration(
                 duration_seconds=6,
             )
 
-    trim_calls = []
+    normalization_calls = []
     monkeypatch.setattr(video_generator, "VIDEO_PROVIDER", "veo")
     monkeypatch.setattr(video_generator, "create_video_provider", FakeProvider)
     monkeypatch.setattr(
         video_generator,
-        "trim_video",
-        lambda **kwargs: trim_calls.append(kwargs),
+        "probe_video",
+        lambda _: composer.VideoInfo(
+            frame_rate=Fraction(24, 1),
+            frame_count=144,
+            duration_seconds=Fraction(6, 1),
+            video_codec="h264",
+            width=1280,
+            height=720,
+            pixel_format="yuv420p",
+            audio_codec=None,
+            audio_sample_rate=None,
+            audio_channels=None,
+        ),
+    )
+    monkeypatch.setattr(
+        video_generator,
+        "normalize_video_clip",
+        lambda *args, **kwargs: normalization_calls.append((args, kwargs)),
     )
 
     video_generator.generate_scene_video(
@@ -188,8 +204,11 @@ def test_generate_scene_video_normalizes_provider_duration(
         aspect_ratio="9:16",
     )
 
-    assert len(trim_calls) == 1
-    assert trim_calls[0]["duration_seconds"] == 5
+    assert len(normalization_calls) == 1
+    assert normalization_calls[0][1] == {
+        "target_frame_rate": Fraction(24, 1),
+        "target_frame_count": 120,
+    }
 
 
 def test_generate_scene_video_uses_first_frame_when_provider_lacks_references(
@@ -230,6 +249,27 @@ def test_generate_scene_video_uses_first_frame_when_provider_lacks_references(
 
     monkeypatch.setattr(video_generator, "VIDEO_PROVIDER", "runway")
     monkeypatch.setattr(video_generator, "create_video_provider", FakeProvider)
+    monkeypatch.setattr(
+        video_generator,
+        "probe_video",
+        lambda _: composer.VideoInfo(
+            frame_rate=Fraction(24, 1),
+            frame_count=120,
+            duration_seconds=Fraction(5, 1),
+            video_codec="h264",
+            width=1280,
+            height=720,
+            pixel_format="yuv420p",
+            audio_codec=None,
+            audio_sample_rate=None,
+            audio_channels=None,
+        ),
+    )
+    monkeypatch.setattr(
+        video_generator,
+        "normalize_video_clip",
+        lambda *_args, **_kwargs: None,
+    )
 
     assert video_generator.generate_scene_video(
         image_path=str(image_path),
@@ -243,22 +283,32 @@ def test_trim_video_writes_normalized_output(monkeypatch, tmp_path):
     input_path = tmp_path / "generated.mp4"
     input_path.write_bytes(b"generated data")
     output_path = tmp_path / "scene.mp4"
-    command_holder = {}
-
-    def fake_run(command, check):
-        command_holder["command"] = command
-        assert check is True
-        Path(command[-1]).write_bytes(b"trimmed data")
-
-    monkeypatch.setattr(composer, "get_ffmpeg", lambda: "ffmpeg")
-    monkeypatch.setattr(composer.subprocess, "run", fake_run)
+    normalization_calls = []
+    source_info = composer.VideoInfo(
+        frame_rate=Fraction(24, 1),
+        frame_count=144,
+        duration_seconds=Fraction(6, 1),
+        video_codec="h264",
+        width=1280,
+        height=720,
+        pixel_format="yuv420p",
+        audio_codec=None,
+        audio_sample_rate=None,
+        audio_channels=None,
+    )
+    monkeypatch.setattr(composer, "probe_video", lambda _: source_info)
+    monkeypatch.setattr(
+        composer,
+        "normalize_video_clip",
+        lambda *args, **kwargs: normalization_calls.append((args, kwargs)),
+    )
 
     assert composer.trim_video(
         input_path=str(input_path),
         output_path=str(output_path),
         duration_seconds=5,
     ) == str(output_path)
-    assert output_path.read_bytes() == b"trimmed data"
-    assert command_holder["command"][
-        command_holder["command"].index("-t") + 1
-    ] == "5"
+    assert normalization_calls[0][1] == {
+        "target_frame_rate": Fraction(24, 1),
+        "target_frame_count": 120,
+    }

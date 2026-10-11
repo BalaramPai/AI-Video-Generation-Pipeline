@@ -1,4 +1,5 @@
 import json
+from fractions import Fraction
 from pathlib import Path
 
 from app.assets.image_generator import (
@@ -8,7 +9,12 @@ from app.assets.image_generator import (
     generate_scene_image_from_reference,
 )
 from app.storyboard.generator import generate_storyboard
-from app.video.composer import concatenate_clips
+from app.video.composer import (
+    calculate_scene_frame_counts,
+    concatenate_clips,
+    normalize_video_clip,
+    probe_video,
+)
 from app.video.continuity import build_continuity_reference
 from app.video.frame_extractor import extract_last_frames
 from app.video.generator import generate_scene_video
@@ -103,6 +109,11 @@ def main():
 
     clip_paths: list[str] = []
     previous_video: str | None = None
+    scene_durations = [
+        scene.duration_seconds for scene in storyboard.scenes
+    ]
+    output_frame_rate: Fraction | None = None
+    scene_frame_counts: list[int] | None = None
 
     for index, scene in enumerate(storyboard.scenes):
         scene_number = index + 1
@@ -154,13 +165,36 @@ def main():
             duration_seconds=scene.duration_seconds,
             aspect_ratio=storyboard.project.aspect_ratio,
             reference_images=continuity_references,
+            target_frame_rate=output_frame_rate,
+            target_frame_count=(
+                scene_frame_counts[index]
+                if scene_frame_counts is not None
+                else None
+            ),
+            normalize_output=index != 0,
         )
+        if output_frame_rate is None:
+            first_clip = probe_video(previous_video)
+            output_frame_rate = first_clip.frame_rate
+            scene_frame_counts = calculate_scene_frame_counts(
+                scene_durations,
+                output_frame_rate,
+            )
+            normalize_video_clip(
+                previous_video,
+                video_path,
+                target_frame_rate=output_frame_rate,
+                target_frame_count=scene_frame_counts[0],
+            )
+            previous_video = str(video_path)
         clip_paths.append(previous_video)
 
     final_path = OUTPUT_DIR / "final_video.mp4"
     concatenate_clips(
         clip_paths=clip_paths,
         output_path=str(final_path),
+        scene_durations_seconds=scene_durations,
+        frame_rate=output_frame_rate,
     )
     print(f"\nFinal video saved to: {final_path}")
 
