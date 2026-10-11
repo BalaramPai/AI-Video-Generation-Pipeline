@@ -1,8 +1,58 @@
 from app.storyboard.generator import (
+    normalize_scene_durations,
     repair_storyboard_continuity,
     validate_storyboard_continuity,
 )
 from app.storyboard.models import Storyboard
+import pytest
+
+
+def test_fifteen_second_storyboard_uses_exact_scene_durations():
+    data = {
+        "project": {"duration_seconds": 15},
+        "scenes": [{"duration_seconds": 5}, {"duration_seconds": 5}],
+    }
+
+    normalize_scene_durations(data)
+
+    assert [scene["duration_seconds"] for scene in data["scenes"]] == [10, 5]
+
+
+def test_non_multiple_duration_is_distributed_exactly():
+    data = {
+        "project": {"duration_seconds": 12},
+        "scenes": [{"duration_seconds": 5}, {"duration_seconds": 5}],
+    }
+
+    normalize_scene_durations(data)
+
+    assert [scene["duration_seconds"] for scene in data["scenes"]] == [10, 2]
+
+
+def test_long_project_requires_enough_scenes():
+    data = {
+        "project": {"duration_seconds": 21},
+        "scenes": [{"duration_seconds": 5}, {"duration_seconds": 5}],
+    }
+
+    with pytest.raises(ValueError, match="at least 3 scenes"):
+        normalize_scene_durations(data)
+
+
+def test_any_project_runtime_is_split_into_supported_scene_durations():
+    data = {
+        "project": {"duration_seconds": 38},
+        "scenes": [{"duration_seconds": 5} for _ in range(4)],
+    }
+
+    normalize_scene_durations(data)
+
+    assert [scene["duration_seconds"] for scene in data["scenes"]] == [
+        10,
+        10,
+        10,
+        8,
+    ]
 
 
 def test_storyboard_model():

@@ -49,7 +49,7 @@ def _build_motion_prompt(storyboard, scene) -> str:
         "flicker, melting objects, or sudden camera cuts."
     )
     return (
-        f"Continuous {scene.duration_seconds}s shot. "
+        "Continuous uninterrupted shot. "
         f"Location: {location.name}; light: {location.lighting}. "
         f"Identity lock: {character_lock}. "
         f"Props: {prop_lock or 'none'}. "
@@ -108,6 +108,7 @@ def main():
         scene_number = index + 1
         image_path = OUTPUT_DIR / f"scene_{scene_number:03d}.png"
         video_path = OUTPUT_DIR / f"scene_{scene_number:03d}.mp4"
+        continuity_references: tuple[str, ...] = ()
 
         if index == 0:
             image_prompt = build_scene_image_prompt(storyboard, scene)
@@ -115,6 +116,7 @@ def main():
                 prompt=image_prompt,
                 output_path=str(image_path),
                 negative_prompt=scene.negative_prompt,
+                aspect_ratio=storyboard.project.aspect_ratio,
             )
         else:
             if previous_video is None:
@@ -131,6 +133,7 @@ def main():
                     output_dir=str(reference_dir),
                 )
             )
+            continuity_references = (reference_frames[-1],)
             image_prompt = build_continuity_image_prompt(
                 storyboard=storyboard,
                 scene=scene,
@@ -140,6 +143,7 @@ def main():
                 prompt=image_prompt,
                 reference_image_path=reference_frames[-1],
                 output_path=str(image_path),
+                aspect_ratio=storyboard.project.aspect_ratio,
             )
 
         motion_prompt = _build_motion_prompt(storyboard, scene)
@@ -148,6 +152,8 @@ def main():
             prompt=motion_prompt,
             output_path=str(video_path),
             duration_seconds=scene.duration_seconds,
+            aspect_ratio=storyboard.project.aspect_ratio,
+            reference_images=continuity_references,
         )
         clip_paths.append(previous_video)
 

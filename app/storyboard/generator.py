@@ -1,77 +1,3 @@
-# from openai import OpenAI
-
-# from app.config import OPENAI_API_KEY, LLM_MODEL
-# from app.prompts.storyboard_prompt import STORYBOARD_SYSTEM_PROMPT
-# from app.storyboard.models import Storyboard
-
-
-# client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# def generate_storyboard(idea: str) -> Storyboard:
-#     response = client.responses.parse(
-#         model=LLM_MODEL,
-#         instructions=STORYBOARD_SYSTEM_PROMPT,
-#         input=idea,
-#         text_format=Storyboard,
-#     )
-
-#     storyboard = response.output_parsed
-
-#     if storyboard is None:
-#         raise RuntimeError(
-#             "The LLM did not return a valid storyboard."
-#         )
-
-#     return storyboard
-
-# import json
-
-# import ollama
-
-# from app.prompts.storyboard_prompt import STORYBOARD_SYSTEM_PROMPT
-# from app.storyboard.models import Storyboard
-
-
-# OLLAMA_MODEL = "llama3.1:8b"
-
-
-# def generate_storyboard(idea: str) -> Storyboard:
-#     response = ollama.chat(
-#         model=OLLAMA_MODEL,
-#         messages=[
-#             {
-#                 "role": "system",
-#                 "content": STORYBOARD_SYSTEM_PROMPT,
-#             },
-#             {
-#                 "role": "user",
-#                 "content": idea,
-#             },
-#         ],
-#         format=Storyboard.model_json_schema(),
-#         options={
-#             "temperature": 0.2,
-#         },
-#     )
-
-#     raw_content = response["message"]["content"]
-
-#     try:
-#         data = json.loads(raw_content)
-#     except json.JSONDecodeError as exc:
-#         raise RuntimeError(
-#             f"Ollama returned invalid JSON:\n{raw_content}"
-#         ) from exc
-
-#     try:
-#         return Storyboard.model_validate(data)
-#     except Exception as exc:
-#         raise RuntimeError(
-#             f"Storyboard failed Pydantic validation:\n{exc}"
-#         ) from exc
-
-
 import json
 import re
 
@@ -122,6 +48,7 @@ def generate_storyboard(idea: str) -> Storyboard:
     # --------------------------------------------------
 
     repair_storyboard_continuity(data)
+    normalize_scene_durations(data)
 
     # --------------------------------------------------
     # VALIDATE WITH PYDANTIC
@@ -132,6 +59,45 @@ def generate_storyboard(idea: str) -> Storyboard:
     validate_storyboard_continuity(storyboard)
 
     return storyboard
+
+
+def normalize_scene_durations(data: dict) -> None:
+    """Allocate an exact runtime across scene clips of at most 10 seconds."""
+    project = data.get("project") or {}
+    scenes = data.get("scenes") or []
+    requested = project.get("duration_seconds")
+
+    if not scenes or isinstance(requested, bool) or not isinstance(requested, int):
+        return
+    if requested <= 0:
+        raise ValueError(
+            "The requested project duration must be a positive number of "
+            "seconds."
+        )
+    if requested < len(scenes):
+        raise ValueError(
+            f"{requested}s cannot be distributed across {len(scenes)} scenes "
+            "while giving every scene a positive duration."
+        )
+    minimum_scene_count = (requested + 9) // 10
+    if len(scenes) < minimum_scene_count:
+        raise ValueError(
+            f"{requested}s requires at least {minimum_scene_count} scenes "
+            "because each generated clip is limited to 10 seconds. "
+            "Ask the storyboard model for more scenes."
+        )
+
+    remaining = requested
+    for index, scene in enumerate(scenes):
+        scenes_left = len(scenes) - index - 1
+        duration = min(10, remaining - scenes_left)
+        scene["duration_seconds"] = duration
+        remaining -= duration
+
+    if remaining != 0:
+        raise ValueError(
+            f"Could not allocate the requested {requested}s across scenes."
+        )
 
 
 def repair_storyboard_continuity(data: dict) -> None:
@@ -217,7 +183,19 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
     if len(prop_ids) != len(storyboard.props):
         raise ValueError("Prop IDs must be unique.")
 
+    if sum(scene.duration_seconds for scene in scenes) != (
+        storyboard.project.duration_seconds
+    ):
+        raise ValueError(
+            "Scene durations must add up exactly to the project duration."
+        )
+
     for index, scene in enumerate(scenes):
+        if scene.duration_seconds > 10:
+            raise ValueError(
+                f"{scene.id} exceeds the 10-second maximum per generated "
+                "clip; split the story into more scenes."
+            )
 
         # ---------------------------------------------
         # SCENE ID

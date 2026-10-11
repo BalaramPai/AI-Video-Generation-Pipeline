@@ -1,142 +1,16 @@
-import base64
-import mimetypes
-import time
+import logging
 from pathlib import Path
-
-import httpx
+from threading import Event
+from typing import Sequence
 
 from app.config import (
-    RUNWAY_API_BASE,
-    RUNWAY_API_SECRET,
-    RUNWAY_MODEL,
-    RUNWAY_POLL_INTERVAL_SECONDS,
-    RUNWAY_TIMEOUT_SECONDS,
     VIDEO_PROVIDER,
 )
-from app.video.composer import create_motion_clip
+from app.video.composer import create_motion_clip, trim_video
+from app.video.providers.factory import create_video_provider
 
 
-RUNWAY_VERSION = "2024-11-06"
-RUNWAY_PROMPT_MAX_CHARS = 1000
-
-
-def _fit_runway_prompt(prompt: str) -> str:
-    """Fit promptText to Runway's documented 1,000-character limit."""
-    normalized = " ".join(prompt.split())
-    if len(normalized) <= RUNWAY_PROMPT_MAX_CHARS:
-        return normalized
-
-    # Prefer a clean word boundary. The caller should put the most
-    # important visual instructions before optional explanatory prose.
-    compact = normalized[: RUNWAY_PROMPT_MAX_CHARS - 3].rsplit(" ", 1)[0]
-    return f"{compact}..."
-
-
-def _image_data_uri(image_path: Path) -> str:
-    mime_type, _ = mimetypes.guess_type(image_path.name)
-    if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
-        raise ValueError(
-            f"Unsupported image format for Runway: {image_path.suffix}"
-        )
-
-    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    data_uri = f"data:{mime_type};base64,{encoded}"
-
-    if len(data_uri.encode("utf-8")) > 5 * 1024 * 1024:
-        raise ValueError(
-            "The image is too large for Runway's data-URI input limit."
-        )
-
-    return data_uri
-
-
-def _runway_headers() -> dict[str, str]:
-    if not RUNWAY_API_SECRET:
-        raise RuntimeError(
-            "RUNWAYML_API_SECRET is required when VIDEO_PROVIDER=runway. "
-            "Add it to .env or choose VIDEO_PROVIDER=ffmpeg."
-        )
-
-    return {
-        "Authorization": f"Bearer {RUNWAY_API_SECRET}",
-        "Content-Type": "application/json",
-        "X-Runway-Version": RUNWAY_VERSION,
-    }
-
-
-def _raise_for_runway_response(response: httpx.Response) -> None:
-    if response.is_success:
-        return
-
-    detail = response.text
-    raise RuntimeError(
-        f"Runway API request failed ({response.status_code}): {detail}"
-    )
-
-
-def _generate_with_runway(
-    image: Path,
-    prompt: str,
-    output: Path,
-    duration_seconds: int,
-) -> str:
-    requested_duration = 10 if duration_seconds >= 10 else 5
-    prompt = _fit_runway_prompt(prompt)
-    payload = {
-        "model": RUNWAY_MODEL,
-        "promptImage": _image_data_uri(image),
-        "promptText": prompt,
-        "ratio": "1280:720",
-        "duration": requested_duration,
-    }
-    headers = _runway_headers()
-
-    with httpx.Client(timeout=120) as client:
-        response = client.post(
-            f"{RUNWAY_API_BASE}/v1/image_to_video",
-            headers=headers,
-            json=payload,
-        )
-        _raise_for_runway_response(response)
-        task_id = response.json().get("id")
-
-        if not task_id:
-            raise RuntimeError(
-                f"Runway returned no task ID: {response.text}"
-            )
-
-        deadline = time.monotonic() + RUNWAY_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            time.sleep(RUNWAY_POLL_INTERVAL_SECONDS)
-            status_response = client.get(
-                f"{RUNWAY_API_BASE}/v1/tasks/{task_id}",
-                headers=headers,
-            )
-            _raise_for_runway_response(status_response)
-            task = status_response.json()
-            status = task.get("status")
-
-            if status == "SUCCEEDED":
-                output_urls = task.get("output", [])
-                if not output_urls:
-                    raise RuntimeError(
-                        f"Runway task succeeded without an output: {task}"
-                    )
-
-                video_response = client.get(output_urls[0])
-                _raise_for_runway_response(video_response)
-                output.write_bytes(video_response.content)
-                return str(output)
-
-            if status in {"FAILED", "CANCELED"}:
-                raise RuntimeError(f"Runway task {status.lower()}: {task}")
-
-            print(f"Runway task {task_id}: {status or 'unknown'}")
-
-    raise TimeoutError(
-        f"Runway task {task_id} did not finish within "
-        f"{RUNWAY_TIMEOUT_SECONDS:g} seconds."
-    )
+logger = logging.getLogger(__name__)
 
 
 def generate_scene_video(
@@ -144,6 +18,10 @@ def generate_scene_video(
     prompt: str,
     output_path: str,
     duration_seconds: int = 5,
+    aspect_ratio: str = "16:9",
+    reference_images: Sequence[str] = (),
+    last_frame_path: str | None = None,
+    cancel_event: Event | None = None,
 ) -> str:
     image = Path(image_path)
 
@@ -155,15 +33,6 @@ def generate_scene_video(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    if VIDEO_PROVIDER == "runway":
-        print(f"\nGenerating real video with Runway: {output}\n")
-        return _generate_with_runway(
-            image=image,
-            prompt=prompt,
-            output=output,
-            duration_seconds=duration_seconds,
-        )
-
     if VIDEO_PROVIDER == "ffmpeg":
         print("\nUsing FFmpeg still-image fallback.\n")
         return create_motion_clip(
@@ -172,7 +41,48 @@ def generate_scene_video(
             duration=duration_seconds,
         )
 
-    raise ValueError(
-        f"Unsupported VIDEO_PROVIDER={VIDEO_PROVIDER!r}. "
-        "Use 'runway' or 'ffmpeg'."
+    provider = create_video_provider(VIDEO_PROVIDER)
+    if not provider.capabilities.image_to_video:
+        raise ValueError(
+            f"VIDEO_PROVIDER={VIDEO_PROVIDER!r} does not support "
+            "image-to-video generation."
+        )
+    if reference_images and not provider.capabilities.reference_images:
+        logger.info(
+            "Using the continuity-adjusted first frame without extra "
+            "reference images",
+            extra={"provider": provider.name},
+        )
+        reference_images = ()
+    if last_frame_path and not provider.capabilities.last_frame:
+        raise ValueError(
+            f"VIDEO_PROVIDER={VIDEO_PROVIDER!r} does not support an explicit "
+            "last frame."
+        )
+    if not provider.capabilities.first_frame:
+        raise ValueError(
+            f"VIDEO_PROVIDER={VIDEO_PROVIDER!r} cannot use the scene image "
+            "as a starting frame."
+        )
+
+    logger.info(
+        "Generating scene video",
+        extra={"provider": provider.name, "output_path": str(output)},
     )
+    result = provider.generate_video(
+        prompt=prompt,
+        output_path=output,
+        duration_seconds=duration_seconds,
+        first_frame=image,
+        last_frame=Path(last_frame_path) if last_frame_path else None,
+        reference_images=tuple(Path(path) for path in reference_images),
+        aspect_ratio=aspect_ratio,
+        cancel_event=cancel_event,
+    )
+    if result.duration_seconds != duration_seconds:
+        trim_video(
+            input_path=str(result.video_path),
+            output_path=str(output),
+            duration_seconds=duration_seconds,
+        )
+    return str(output)

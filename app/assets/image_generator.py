@@ -18,6 +18,28 @@ IMAGE_NEGATIVE_PROMPT = (
     "changing identity, changed clothing, text, watermark, logo, bad hands"
 )
 
+_IMAGE_DIMENSIONS = {
+    "16:9": (768, 432),
+    "9:16": (432, 768),
+    "4:3": (576, 432),
+    "3:4": (432, 576),
+    "1:1": (512, 512),
+    "21:9": (672, 288),
+    "3:2": (768, 512),
+    "2:3": (512, 768),
+}
+
+
+def _image_dimensions(aspect_ratio: str) -> tuple[int, int]:
+    try:
+        return _IMAGE_DIMENSIONS[aspect_ratio]
+    except KeyError as exc:
+        supported = ", ".join(_IMAGE_DIMENSIONS)
+        raise ValueError(
+            f"Unsupported image aspect ratio {aspect_ratio!r}. "
+            f"Choose one of: {supported}."
+        ) from exc
+
 
 def _character_prompt(character) -> str:
     appearance = character.appearance
@@ -47,30 +69,44 @@ def _fit_image_prompt(
     minimum_components: int = 5,
 ) -> str:
     """Keep SD 1.5 prompts inside CLIP's usable 75-token budget."""
-    prompt = ", ".join(component for component in components if component)
-    token_count = TOKENIZER(
-        prompt,
-        truncation=False,
-        return_tensors="pt",
-        verbose=False,
-    )["input_ids"].shape[1]
 
-    if token_count <= 75:
-        return prompt
-
-    # Remove optional prose before shortening identity or action details.
-    required = components[:]
-    while len(required) > minimum_components:
-        required.pop()
-        prompt = ", ".join(component for component in required if component)
-        token_count = TOKENIZER(
-            prompt,
+    def _token_count(text: str) -> int:
+        return TOKENIZER(
+            text,
             truncation=False,
             return_tensors="pt",
             verbose=False,
         )["input_ids"].shape[1]
+
+    prompt = ", ".join(component for component in components if component)
+    token_count = _token_count(prompt)
+    if token_count <= 75:
+        return prompt
+
+    # Remove the least-important optional blocks first, but keep the key
+    # identity/action facts. If the prompt still exceeds the hard cap, final
+    # fallback to a tokenizer-guided truncation so the request is valid.
+    required = components[:]
+    while len(required) > minimum_components:
+        required.pop()
+        prompt = ", ".join(component for component in required if component)
+        token_count = _token_count(prompt)
         if token_count <= 75:
             return prompt
+
+    compacted = TOKENIZER(
+        prompt,
+        truncation=True,
+        max_length=75,
+        return_tensors="pt",
+        verbose=False,
+    )
+    compact_prompt = TOKENIZER.decode(
+        compacted["input_ids"][0],
+        skip_special_tokens=True,
+    ).strip()
+    if compact_prompt:
+        return compact_prompt
 
     raise ValueError(
         f"{label} is too long for SD 1.5 CLIP after removing optional "
@@ -164,6 +200,7 @@ def generate_scene_image(
     prompt: str,
     output_path: str,
     negative_prompt: str = IMAGE_NEGATIVE_PROMPT,
+    aspect_ratio: str = "16:9",
 ) -> str:
 
     output = Path(output_path)
@@ -177,11 +214,12 @@ def generate_scene_image(
 
     print("\nGenerating image...\n")
 
+    width, height = _image_dimensions(aspect_ratio)
     image = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt or IMAGE_NEGATIVE_PROMPT,
-        width=768,
-        height=432,
+        width=width,
+        height=height,
         num_inference_steps=35,
         guidance_scale=6.5,
     ).images[0]
@@ -246,6 +284,7 @@ def generate_scene_image_from_reference(
     prompt: str,
     reference_image_path: str,
     output_path: str,
+    aspect_ratio: str = "16:9",
 ) -> str:
 
     from diffusers import StableDiffusionImg2ImgPipeline
@@ -262,6 +301,7 @@ def generate_scene_image_from_reference(
 
     print("\nGenerating Scene 2 from continuity reference...\n")
 
+    width, height = _image_dimensions(aspect_ratio)
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
@@ -275,6 +315,8 @@ def generate_scene_image_from_reference(
         prompt=prompt,
         negative_prompt=IMAGE_NEGATIVE_PROMPT,
         image=image,
+        width=width,
+        height=height,
         # A low denoise strength preserves the reference identity and
         # composition instead of redrawing the subject from scratch.
         strength=0.30,

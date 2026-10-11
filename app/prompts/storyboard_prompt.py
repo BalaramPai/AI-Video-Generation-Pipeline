@@ -84,6 +84,15 @@ clip.
 
 The scenes must connect naturally when concatenated together.
 
+The sum of every scene's duration_seconds MUST equal the project's
+duration_seconds exactly. Project duration can be any positive whole number
+of seconds. Each scene becomes one generated clip and MUST be 10 seconds or
+less so it works with both supported Runway models. Use enough scenes to
+cover long projects; prefer 5- to 10-second scenes when possible, with a
+shorter final scene when needed to match the exact runtime.
+If the user specifies an exact runtime in their idea, use that number for
+project.duration_seconds. Otherwise choose a reasonable runtime for the idea.
+
 Do not restart an action at the beginning of a new scene if that
 action already happened in the previous scene.
 
@@ -294,6 +303,19 @@ that character MUST appear in character_ids.
 
 For example, if a barista hands a coffee to the protagonist,
 the barista must be included in character_ids.
+
+This rule is strict: never mention a barista, customer, friend, cashier,
+driver, or any other visible person in action or visual_description
+without creating that person as a Character with a stable appearance
+and including the matching ID in character_ids for that scene. The
+protagonist alone is not enough for an interaction scene.
+
+If the user's idea explicitly includes a role such as a barista, create
+that supporting character even if the role is not named. Give the role
+a stable name (for example, Maya, the barista), detailed appearance,
+and role field. Keep the supporting character visible in the relevant
+scene and do not replace the interaction with an empty counter or an
+unexplained self-service action.
 
 ==================================================
 ACTION CONTINUITY
