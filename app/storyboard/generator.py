@@ -143,6 +143,17 @@ def repair_storyboard_continuity(data: dict) -> None:
                 visual_description or action
             )
 
+        character_state = continuity.get("character_state")
+        if (
+            not scene.get("character_ids")
+            and (
+                character_state is None
+                or str(character_state).strip().lower()
+                in {"", "null", "none"}
+            )
+        ):
+            continuity["character_state"] = visual_description or action
+
         # Optional detail fields are still made explicit in the persisted
         # storyboard so downstream prompt builders have a stable shape.
         scene.setdefault("blocking", "")

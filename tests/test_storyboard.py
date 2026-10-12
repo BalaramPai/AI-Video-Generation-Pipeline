@@ -188,3 +188,85 @@ def test_missing_ending_state_is_repaired_from_scene_description():
         data["scenes"][0]["continuity"]["ending_state"]
         == "The man is seated at a window table with his coffee."
     )
+
+
+def test_character_free_scene_uses_visible_subject_as_character_state():
+    data = {
+        "scenes": [
+            {
+                "id": "SCENE_001",
+                "character_ids": [],
+                "action": "The engine cover opens to reveal the cylinders.",
+                "visual_description": (
+                    "A gasoline engine sits in a clean studio with its "
+                    "cover open and cylinders visible."
+                ),
+                "continuity": {
+                    "character_state": "",
+                    "environment_state": "A clean, bright studio.",
+                    "required_start_state": "The engine is closed.",
+                    "ending_state": "The engine cover is open.",
+                },
+            }
+        ]
+    }
+
+    repair_storyboard_continuity(data)
+
+    assert data["scenes"][0]["continuity"]["character_state"] == (
+        "A gasoline engine sits in a clean studio with its "
+        "cover open and cylinders visible."
+    )
+
+
+def test_character_free_storyboard_passes_continuity_validation():
+    storyboard = Storyboard(
+        project={
+            "title": "Engine Explainer",
+            "description": "An educational view inside an engine.",
+            "duration_seconds": 5,
+            "aspect_ratio": "16:9",
+            "visual_style": "Clean instructional 3D animation",
+        },
+        characters=[],
+        locations=[
+            {
+                "id": "LOC_001",
+                "name": "Studio",
+                "description": "A clean instructional studio.",
+                "lighting": "Even studio lighting",
+                "visual_style": "Clean 3D animation",
+            }
+        ],
+        props=[],
+        scenes=[
+            {
+                "id": "SCENE_001",
+                "duration_seconds": 5,
+                "location_id": "LOC_001",
+                "character_ids": [],
+                "prop_ids": [],
+                "action": "The engine cover opens to reveal the pistons.",
+                "visual_description": (
+                    "The open engine reveals four pistons in a clean "
+                    "studio."
+                ),
+                "camera": {
+                    "shot_type": "Medium shot",
+                    "angle": "Side view",
+                    "movement": "Slow steady push-in",
+                },
+                "continuity": {
+                    "previous_scene_id": None,
+                    "character_state": (
+                        "The engine is open with four pistons visible."
+                    ),
+                    "environment_state": "The studio remains evenly lit.",
+                    "required_start_state": "The engine is closed.",
+                    "ending_state": "The four pistons are visible.",
+                },
+            }
+        ],
+    )
+
+    validate_storyboard_continuity(storyboard)

@@ -84,6 +84,12 @@ clip.
 
 The scenes must connect naturally when concatenated together.
 
+For continuity.character_state, describe the characters' physical state
+when characters are present. For a scene with no characters, describe the
+main visible subject's physical state instead (for example, a vehicle,
+machine, or object). Do not leave this field empty just because the scene
+has no people or creatures.
+
 The sum of every scene's duration_seconds MUST equal the project's
 duration_seconds exactly. Project duration can be any positive whole number
 of seconds. Each scene becomes one generated clip and MUST be 10 seconds or
