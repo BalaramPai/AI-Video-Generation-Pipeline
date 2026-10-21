@@ -1,202 +1,97 @@
-import json
-from fractions import Fraction
+import argparse
+import sys
 from pathlib import Path
 
-from app.assets.image_generator import (
-    build_continuity_image_prompt,
-    build_scene_image_prompt,
-    generate_scene_image,
-    generate_scene_image_from_reference,
-)
-from app.storyboard.generator import generate_storyboard
-from app.video.composer import (
-    calculate_scene_frame_counts,
-    concatenate_clips,
-    normalize_video_clip,
-    probe_video,
-)
-from app.video.continuity import build_continuity_reference
-from app.video.frame_extractor import extract_last_frames
-from app.video.generator import generate_scene_video
+from app.storyboard.io import load_storyboard_file, parse_storyboard_json
+from app.storyboard.models import Storyboard
+from app.video.pipeline import generate_video_from_storyboard
 
 
-OUTPUT_DIR = Path("outputs")
-
-
-def _build_motion_prompt(storyboard, scene) -> str:
-    location = next(
-        location for location in storyboard.locations
-        if location.id == scene.location_id
+def _read_pasted_storyboard() -> Storyboard:
+    print(
+        "Paste the complete storyboard JSON below. "
+        "When finished, enter END on its own line:"
     )
-    characters = [
-        character for character in storyboard.characters
-        if character.id in scene.character_ids
-    ]
-    character_lock = "; ".join(
-        (
-            f"{character.name}: age {character.appearance.age}, "
-            f"{character.appearance.hair}, "
-            f"{character.appearance.facial_features}, "
-            f"{character.appearance.clothing}"
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == "END":
+            break
+        lines.append(line)
+
+    if not lines or not any(line.strip() for line in lines):
+        raise ValueError("No storyboard JSON was provided.")
+    return parse_storyboard_json("\n".join(lines))
+
+
+def _load_input_storyboard(file_argument: str | None) -> Storyboard:
+    if file_argument == "-":
+        return parse_storyboard_json(sys.stdin.read())
+    if file_argument:
+        return load_storyboard_file(file_argument)
+
+    source = input(
+        "Storyboard JSON file path (or press Enter to paste JSON): "
+    ).strip()
+    if source:
+        return load_storyboard_file(source)
+    return _read_pasted_storyboard()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate a video from an existing storyboard JSON."
+    )
+    parser.add_argument(
+        "storyboard",
+        nargs="?",
+        help=(
+            "Path to storyboard JSON. Use '-' to read JSON from standard "
+            "input; omit to choose a file or paste interactively."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="outputs",
+        help="Directory for scene assets and final video (default: outputs).",
+    )
+    args = parser.parse_args()
+
+    storyboard = _load_input_storyboard(args.storyboard)
+    try:
+        output_path = generate_video_from_storyboard(
+            storyboard,
+            output_dir=Path(args.output_dir),
         )
-        for character in characters
-    )
-    prop_lock = ", ".join(
-        ", ".join(
-            detail for detail in
-            (prop.description, prop.continuity_anchor) if detail
+    except KeyboardInterrupt:
+        task_states = sorted(
+            Path(args.output_dir).glob("*.runway-task.json")
         )
-        for prop in storyboard.props
-        if prop.id in scene.prop_ids
-    )
-    negative = scene.negative_prompt or (
-        "No identity changes, face morphing, duplicate people, extra limbs, "
-        "warped hands, costume changes, prop teleportation, text, logos, "
-        "flicker, melting objects, or sudden camera cuts."
-    )
-    return (
-        "Continuous uninterrupted shot. "
-        f"Location: {location.name}; light: {location.lighting}. "
-        f"Identity lock: {character_lock}. "
-        f"Props: {prop_lock or 'none'}. "
-        f"Start: {scene.continuity.required_start_state}. "
-        f"Blocking: {scene.blocking}. "
-        f"Action: {scene.action}. "
-        f"End: {scene.continuity.ending_state}. "
-        f"Camera: {scene.camera.shot_type}, {scene.camera.angle}, "
-        f"{scene.camera.movement}, {scene.camera.lens or 'natural lens'}. "
-        f"Preserve faces, proportions, wardrobe, lighting, composition, "
-        f"and prop positions; animate only this action naturally. "
-        f"Avoid: {negative}"
-    )
-
-
-def main():
-    idea = input("\nEnter your video idea:\n> ").strip()
-
-    if not idea:
-        raise ValueError("Video idea cannot be empty.")
-
-    print("\nGenerating storyboard...\n")
-
-    storyboard = generate_storyboard(idea)
-
-    storyboard_data = storyboard.model_dump()
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    print(json.dumps(
-        storyboard_data,
-        indent=2,
-        ensure_ascii=False,
-    ))
-
-    output_path = OUTPUT_DIR / "storyboard.json"
-
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            storyboard_data,
-            file,
-            indent=2,
-            ensure_ascii=False,
+        print(
+            "\nGeneration interrupted. A submitted Runway task may continue "
+            "remotely.",
+            file=sys.stderr,
         )
-
-    print(f"\nStoryboard saved to: {output_path}")
-
-    clip_paths: list[str] = []
-    previous_video: str | None = None
-    scene_durations = [
-        scene.duration_seconds for scene in storyboard.scenes
-    ]
-    output_frame_rate: Fraction | None = None
-    scene_frame_counts: list[int] | None = None
-
-    for index, scene in enumerate(storyboard.scenes):
-        scene_number = index + 1
-        image_path = OUTPUT_DIR / f"scene_{scene_number:03d}.png"
-        video_path = OUTPUT_DIR / f"scene_{scene_number:03d}.mp4"
-        continuity_references: tuple[str, ...] = ()
-
-        if index == 0:
-            image_prompt = build_scene_image_prompt(storyboard, scene)
-            generate_scene_image(
-                prompt=image_prompt,
-                output_path=str(image_path),
-                negative_prompt=scene.negative_prompt,
-                aspect_ratio=storyboard.project.aspect_ratio,
+        if task_states:
+            print(
+                "Saved task state found. Rerun with the same storyboard and "
+                "output directory to resume without submitting another "
+                "generation request:",
+                file=sys.stderr,
             )
+            for task_state in task_states:
+                print(f"  {task_state}", file=sys.stderr)
         else:
-            if previous_video is None:
-                raise RuntimeError(
-                    "A previous scene video is required for continuity."
-                )
-
-            reference_dir = OUTPUT_DIR / (
-                f"scene_{index:03d}_end_frames"
+            print(
+                "No resumable task state was found; check your Runway task "
+                "history before retrying to avoid duplicate generation.",
+                file=sys.stderr,
             )
-            reference_frames = build_continuity_reference(
-                extract_last_frames(
-                    video_path=previous_video,
-                    output_dir=str(reference_dir),
-                )
-            )
-            continuity_references = (reference_frames[-1],)
-            image_prompt = build_continuity_image_prompt(
-                storyboard=storyboard,
-                scene=scene,
-                reference_frames=reference_frames,
-            )
-            generate_scene_image_from_reference(
-                prompt=image_prompt,
-                reference_image_path=reference_frames[-1],
-                output_path=str(image_path),
-                aspect_ratio=storyboard.project.aspect_ratio,
-            )
-
-        motion_prompt = _build_motion_prompt(storyboard, scene)
-        previous_video = generate_scene_video(
-            image_path=str(image_path),
-            prompt=motion_prompt,
-            output_path=str(video_path),
-            duration_seconds=scene.duration_seconds,
-            aspect_ratio=storyboard.project.aspect_ratio,
-            reference_images=continuity_references,
-            target_frame_rate=output_frame_rate,
-            target_frame_count=(
-                scene_frame_counts[index]
-                if scene_frame_counts is not None
-                else None
-            ),
-            normalize_output=index != 0,
-        )
-        if output_frame_rate is None:
-            first_clip = probe_video(previous_video)
-            output_frame_rate = first_clip.frame_rate
-            scene_frame_counts = calculate_scene_frame_counts(
-                scene_durations,
-                output_frame_rate,
-            )
-            normalize_video_clip(
-                previous_video,
-                video_path,
-                target_frame_rate=output_frame_rate,
-                target_frame_count=scene_frame_counts[0],
-            )
-            previous_video = str(video_path)
-        clip_paths.append(previous_video)
-
-    final_path = OUTPUT_DIR / "final_video.mp4"
-    concatenate_clips(
-        clip_paths=clip_paths,
-        output_path=str(final_path),
-        scene_durations_seconds=scene_durations,
-        frame_rate=output_frame_rate,
-    )
-    print(f"\nFinal video saved to: {final_path}")
+        return
+    print(f"\nFinal video saved to: {output_path}")
 
 
 if __name__ == "__main__":

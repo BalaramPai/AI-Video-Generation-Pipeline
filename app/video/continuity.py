@@ -11,10 +11,13 @@ def build_continuity_reference(
         )
 
     for frame in frame_paths:
-        if not Path(frame).exists():
+        path = Path(frame)
+        if not path.is_file():
             raise FileNotFoundError(
                 f"Reference frame not found: {frame}"
             )
+        if path.stat().st_size == 0:
+            raise ValueError(f"Reference frame is empty: {frame}")
 
     return frame_paths
 

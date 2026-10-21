@@ -226,6 +226,27 @@ def test_runway_prompt_limit_counts_utf16_code_units():
     assert len(fitted_token) == RUNWAY_PROMPT_MAX_CHARACTERS
 
 
+def test_runway_rejects_separate_reference_images_without_api_request(tmp_path):
+    first_frame = tmp_path / "first.png"
+    reference = tmp_path / "reference.png"
+    first_frame.write_bytes(b"first")
+    reference.write_bytes(b"reference")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: pytest.fail(f"Unexpected request: {request.url}")
+        )
+    ) as client:
+        with pytest.raises(ValueError, match="does not support separate"):
+            _provider(client).generate_video(
+                prompt="Continue the same scene.",
+                output_path=tmp_path / "scene.mp4",
+                duration_seconds=5,
+                first_frame=first_frame,
+                reference_images=(reference,),
+            )
+
+
 def test_runway_failure_status_is_reported(tmp_path):
     image_path = tmp_path / "scene.png"
     image_path.write_bytes(b"image")
@@ -275,9 +296,103 @@ def test_runway_polling_can_be_cancelled(tmp_path):
             )
 
 
-def test_runway_polling_times_out(tmp_path):
+def test_interrupted_runway_task_resumes_without_resubmitting(tmp_path):
+    image_path = tmp_path / "scene.png"
+    original_image = b"original image"
+    image_path.write_bytes(original_image)
+    output_path = tmp_path / "scene.mp4"
+    requests = []
+    interrupt_poll = True
+
+    def handle_request(request):
+        nonlocal interrupt_poll
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"id": "resumable-task"})
+        if request.url.path == "/v1/tasks/resumable-task":
+            if interrupt_poll:
+                interrupt_poll = False
+                raise KeyboardInterrupt
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resumable-task",
+                    "status": "SUCCEEDED",
+                    "output": ["https://cdn.runwayml.com/resumed.mp4"],
+                },
+            )
+        if request.url.host == "cdn.runwayml.com":
+            return httpx.Response(200, content=b"resumed video")
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handle_request)) as client:
+        provider = _provider(client)
+        with pytest.raises(KeyboardInterrupt):
+            provider.generate_video(
+                prompt="Continue the same filter demonstration.",
+                output_path=output_path,
+                duration_seconds=5,
+                first_frame=image_path,
+                aspect_ratio="16:9",
+            )
+
+        task_state_path = tmp_path / "scene.runway-task.json"
+        assert task_state_path.is_file()
+        assert (tmp_path / "scene.runway-input.png").read_bytes() == original_image
+
+        image_path.write_bytes(b"regenerated image")
+        result = provider.generate_video(
+            prompt="Continue the same filter demonstration.",
+            output_path=output_path,
+            duration_seconds=5,
+            first_frame=image_path,
+            aspect_ratio="16:9",
+        )
+
+    assert sum(request.method == "POST" for request in requests) == 1
+    assert image_path.read_bytes() == original_image
+    assert output_path.read_bytes() == b"resumed video"
+    assert result.generation_id == "resumable-task"
+    assert not task_state_path.exists()
+    assert not (tmp_path / "scene.runway-input.png").exists()
+
+
+def test_runway_does_not_resubmit_when_saved_request_changed(tmp_path):
     image_path = tmp_path / "scene.png"
     image_path.write_bytes(b"image")
+    output_path = tmp_path / "scene.mp4"
+
+    def handle_request(request):
+        if request.method == "POST":
+            return httpx.Response(200, json={"id": "pending-task"})
+        raise KeyboardInterrupt
+
+    with httpx.Client(transport=httpx.MockTransport(handle_request)) as client:
+        provider = _provider(client)
+        with pytest.raises(KeyboardInterrupt):
+            provider.generate_video(
+                prompt="Original prompt.",
+                output_path=output_path,
+                duration_seconds=5,
+                first_frame=image_path,
+            )
+
+        with pytest.raises(VideoProviderError, match="avoid.*duplicate"):
+            provider.generate_video(
+                prompt="Changed prompt.",
+                output_path=output_path,
+                duration_seconds=5,
+                first_frame=image_path,
+            )
+
+
+def test_runway_polling_times_out_and_keeps_resumable_task(
+    tmp_path,
+    capsys,
+):
+    image_path = tmp_path / "scene.png"
+    image_path.write_bytes(b"image")
+    output_path = tmp_path / "unused.mp4"
 
     def handle_request(request):
         if request.method == "POST":
@@ -295,10 +410,13 @@ def test_runway_polling_times_out(tmp_path):
                 timeout_seconds=0.005,
             ).generate_video(
                 prompt="A test clip.",
-                output_path=Path("unused.mp4"),
+                output_path=output_path,
                 duration_seconds=5,
                 first_frame=image_path,
             )
+
+    assert (tmp_path / "unused.runway-task.json").is_file()
+    assert "rerun with the same storyboard" in capsys.readouterr().out
 
 
 def test_runway_rejects_non_https_output_url(tmp_path):

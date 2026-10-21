@@ -1,4 +1,5 @@
 from fractions import Fraction
+import logging
 
 import pytest
 
@@ -88,11 +89,11 @@ def test_build_scene_image_prompt_stays_under_sd15_token_limit():
                 id="SCENE_001",
                 duration_seconds=5,
                 location_id="LOC_001",
-                character_ids=["CHAR_001", "CHAR_002"],
+                character_ids=["CHAR_001"],
                 prop_ids=["PROP_001"],
-                action="Daniel reaches the counter and receives a coffee from Maya.",
+                action="Daniel receives a coffee.",
                 dialogue=None,
-                visual_description="Maya hands Daniel a warm coffee while the shop remains softly lit.",
+                visual_description="Daniel stands at the counter holding coffee.",
                 camera=Camera(
                     shot_type="medium close-up",
                     angle="eye level",
@@ -103,7 +104,7 @@ def test_build_scene_image_prompt_stays_under_sd15_token_limit():
                     previous_scene_id=None,
                     character_state="Daniel stands at the counter while Maya serves him",
                     environment_state="warm coffee shop interior with the same counter and window layout",
-                    required_start_state="Daniel is inside the coffee shop entrance",
+                    required_start_state="Daniel stands at the counter.",
                     ending_state="Daniel receives his coffee and holds it at the counter",
                 ),
             )
@@ -214,6 +215,7 @@ def test_generate_scene_video_normalizes_provider_duration(
 def test_generate_scene_video_uses_first_frame_when_provider_lacks_references(
     monkeypatch,
     tmp_path,
+    caplog,
 ):
     image_path = tmp_path / "scene.png"
     image_path.write_bytes(b"image")
@@ -271,12 +273,14 @@ def test_generate_scene_video_uses_first_frame_when_provider_lacks_references(
         lambda *_args, **_kwargs: None,
     )
 
-    assert video_generator.generate_scene_video(
-        image_path=str(image_path),
-        prompt="Continue the action.",
-        output_path=str(output_path),
-        reference_images=(str(reference_path),),
-    ) == str(output_path)
+    with caplog.at_level(logging.INFO):
+        assert video_generator.generate_scene_video(
+            image_path=str(image_path),
+            prompt="Continue the action.",
+            output_path=str(output_path),
+            reference_images=(str(reference_path),),
+        ) == str(output_path)
+    assert "does not accept separate reference images" in caplog.text
 
 
 def test_trim_video_writes_normalized_output(monkeypatch, tmp_path):

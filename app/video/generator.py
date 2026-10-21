@@ -58,9 +58,18 @@ def generate_scene_video(
             )
         if reference_images and not provider.capabilities.reference_images:
             logger.info(
-                "Using the continuity-adjusted first frame without extra "
-                "reference images",
-                extra={"provider": provider.name},
+                "Provider does not accept separate reference images; "
+                "the supplied first frame remains the scene conditioning "
+                "image",
+                extra={
+                    "provider": provider.name,
+                    "model": getattr(provider, "_model", None),
+                    "reference_images_requested": [
+                        str(path) for path in reference_images
+                    ],
+                    "reference_images_submitted": [],
+                    "first_frame": str(image),
+                },
             )
             reference_images = ()
         if last_frame_path and not provider.capabilities.last_frame:
@@ -76,7 +85,21 @@ def generate_scene_video(
 
         logger.info(
             "Generating scene video",
-            extra={"provider": provider.name, "output_path": str(output)},
+            extra={
+                "provider": provider.name,
+                "model": getattr(provider, "_model", None),
+                "output_path": str(output),
+                "duration_seconds": duration_seconds,
+                "aspect_ratio": aspect_ratio,
+                "prompt": prompt,
+                "first_frame": str(image),
+                "last_frame": (
+                    str(last_frame_path) if last_frame_path else None
+                ),
+                "reference_images_submitted": [
+                    str(path) for path in reference_images
+                ],
+            },
         )
         result = provider.generate_video(
             prompt=prompt,

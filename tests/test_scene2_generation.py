@@ -1,53 +1,61 @@
-import json
-from pathlib import Path
+from PIL import Image
 
-from app.assets.image_generator import (
-    build_continuity_image_prompt,
-    generate_scene_image_from_reference,
-)
-from app.video.continuity import (
-    build_continuity_reference,
-)
-from app.storyboard.models import Storyboard
+import app.assets.image_generator as image_generator
+from tests.test_image_prompt import _circuit_storyboard
 
 
-def test_generate_scene2_from_continuity():
+def test_generate_scene2_from_continuity_uses_reference_and_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    reference_path = tmp_path / "reference.png"
+    Image.new("RGB", (32, 32)).save(reference_path)
+    captured = {}
 
-    with open(
-        "outputs/storyboard.json",
-        "r",
-        encoding="utf-8",
-    ) as file:
-        data = json.load(file)
+    class FakePipeline:
+        tokenizer = image_generator.TOKENIZER
 
-    storyboard = Storyboard.model_validate(data)
+        def enable_model_cpu_offload(self):
+            pass
 
-    scene_2 = storyboard.scenes[1]
+        def __call__(self, **kwargs):
+            captured.update(kwargs)
+            return type(
+                "Result",
+                (),
+                {"images": [Image.new("RGB", (16, 16))]},
+            )()
 
-    frames = sorted(
-        str(path)
-        for path in Path(
-            "outputs/scene_001_end_frames"
-        ).glob("frame_*.png")
+    class FakeImg2ImgPipeline:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return FakePipeline()
+
+    import diffusers
+
+    monkeypatch.setattr(
+        diffusers,
+        "StableDiffusionImg2ImgPipeline",
+        FakeImg2ImgPipeline,
     )
-
-    reference_frames = build_continuity_reference(
-        frames
-    )
-
-    prompt = build_continuity_image_prompt(
+    storyboard = _circuit_storyboard()
+    scene = storyboard.scenes[1]
+    prompt = image_generator.build_continuity_image_prompt(
         storyboard=storyboard,
-        scene=scene_2,
-        reference_frames=reference_frames,
+        scene=scene,
+        reference_frames=[str(reference_path)],
     )
+    output_path = tmp_path / "scene2.png"
 
-    # Latest frame is the actual visual conditioning image.
-    reference_image = reference_frames[-1]
-
-    output = generate_scene_image_from_reference(
+    result = image_generator.generate_scene_image_from_reference(
         prompt=prompt,
-        reference_image_path=reference_image,
-        output_path="outputs/scene_002.png",
+        reference_image_path=str(reference_path),
+        output_path=str(output_path),
     )
 
-    assert Path(output).exists()
+    assert output_path.is_file()
+    assert result == str(output_path)
+    assert captured["prompt"] == prompt
+    assert captured["image"].size == (32, 32)
+    assert "same battery, wire, open switch, unlit bulb" in prompt.lower()
+    assert "close switch; bulb lights" in prompt.lower()

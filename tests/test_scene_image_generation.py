@@ -1,39 +1,37 @@
-import json
 from pathlib import Path
 
-from app.assets.image_generator import (
-    build_scene_image_prompt,
-    generate_scene_image,
-)
-from app.storyboard.models import Storyboard
+import app.assets.image_generator as image_generator
+from tests.test_image_prompt import _circuit_storyboard
 
 
-def test_generate_scene_image():
-
-    storyboard_path = Path("outputs/storyboard.json")
-
-    with open(
-        storyboard_path,
-        "r",
-        encoding="utf-8",
-    ) as file:
-        data = json.load(file)
-
-    storyboard = Storyboard.model_validate(data)
-
+def test_generate_scene_image_uses_built_storyboard_prompt(
+    monkeypatch,
+    tmp_path,
+):
+    storyboard = _circuit_storyboard()
     scene = storyboard.scenes[0]
+    captured = {}
+    output_path = tmp_path / "scene.png"
 
-    prompt = build_scene_image_prompt(
-        storyboard=storyboard,
-        scene=scene,
+    def fake_generate_scene_image(**kwargs):
+        captured.update(kwargs)
+        Path(kwargs["output_path"]).write_bytes(b"image")
+        return kwargs["output_path"]
+
+    monkeypatch.setattr(
+        image_generator,
+        "generate_scene_image",
+        fake_generate_scene_image,
     )
+    prompt = image_generator.build_scene_image_prompt(storyboard, scene)
 
-    output_path = "outputs/scene_001.png"
-
-    result = generate_scene_image(
+    result = image_generator.generate_scene_image(
         prompt=prompt,
-        output_path=output_path,
+        output_path=str(output_path),
     )
 
-    assert Path(result) == Path(output_path)
-    assert Path(output_path).exists()
+    assert result == str(output_path)
+    assert output_path.is_file()
+    assert captured["prompt"] == prompt
+    assert "open switch" in prompt.lower()
+    assert "bulb stays unlit" in prompt.lower()

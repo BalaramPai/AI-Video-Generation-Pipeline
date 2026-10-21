@@ -270,3 +270,57 @@ def test_character_free_storyboard_passes_continuity_validation():
     )
 
     validate_storyboard_continuity(storyboard)
+
+
+def test_validation_rejects_missing_scene_action_or_initial_state():
+    data = {
+        "project": {
+            "title": "Test",
+            "description": "Test",
+            "duration_seconds": 5,
+            "aspect_ratio": "16:9",
+            "visual_style": "Instructional",
+        },
+        "characters": [],
+        "locations": [
+            {
+                "id": "LOC_001",
+                "name": "Studio",
+                "description": "Neutral studio",
+                "lighting": "Even light",
+                "visual_style": "Clean",
+            }
+        ],
+        "props": [],
+        "scenes": [
+            {
+                "id": "SCENE_001",
+                "duration_seconds": 5,
+                "location_id": "LOC_001",
+                "character_ids": [],
+                "prop_ids": [],
+                "action": "",
+                "visual_description": "A clear view of the subject.",
+                "camera": {
+                    "shot_type": "Wide view",
+                    "angle": "Straight on",
+                    "movement": "Locked camera",
+                },
+                "continuity": {
+                    "previous_scene_id": None,
+                    "character_state": "The subject is stationary.",
+                    "environment_state": "The studio is evenly lit.",
+                    "required_start_state": "The subject is intact.",
+                    "ending_state": "The subject remains intact.",
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="scene-specific action"):
+        validate_storyboard_continuity(Storyboard.model_validate(data))
+
+    data["scenes"][0]["action"] = "The subject turns to the left."
+    data["scenes"][0]["continuity"]["required_start_state"] = " "
+    with pytest.raises(ValueError, match="concrete required_start_state"):
+        validate_storyboard_continuity(Storyboard.model_validate(data))

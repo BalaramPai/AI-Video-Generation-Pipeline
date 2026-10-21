@@ -1,14 +1,15 @@
 import json
 import re
 
-import ollama
-
-from app.config import OLLAMA_MODEL
-from app.prompts.storyboard_prompt import STORYBOARD_SYSTEM_PROMPT
 from app.storyboard.models import Storyboard
 
 
 def generate_storyboard(idea: str) -> Storyboard:
+    import ollama
+
+    from app.config import OLLAMA_MODEL
+    from app.prompts.storyboard_prompt import STORYBOARD_SYSTEM_PROMPT
+
     try:
         response = ollama.chat(
             model=OLLAMA_MODEL,
@@ -201,6 +202,22 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
             "Scene durations must add up exactly to the project duration."
         )
 
+    for location in storyboard.locations:
+        if not location.name.strip() or not location.lighting.strip():
+            raise ValueError(
+                f"{location.id} must define a location name and lighting."
+            )
+    for character in storyboard.characters:
+        if not character.name.strip():
+            raise ValueError(
+                f"{character.id} must define a character name."
+            )
+    for prop in storyboard.props:
+        if not prop.name.strip() or not prop.description.strip():
+            raise ValueError(
+                f"{prop.id} must define a prop name and description."
+            )
+
     for index, scene in enumerate(scenes):
         if scene.duration_seconds > 10:
             raise ValueError(
@@ -214,6 +231,24 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
 
         if not scene.id:
             raise ValueError("Every scene must have an ID.")
+        if not scene.action.strip():
+            raise ValueError(f"{scene.id} must define a scene-specific action.")
+        if not scene.visual_description.strip():
+            raise ValueError(
+                f"{scene.id} must define a visual_description."
+            )
+        if not all(
+            value.strip()
+            for value in (
+                scene.camera.shot_type,
+                scene.camera.angle,
+                scene.camera.movement,
+            )
+        ):
+            raise ValueError(
+                f"{scene.id} must define camera shot_type, angle, and "
+                "movement."
+            )
 
         # ---------------------------------------------
         # PREVIOUS SCENE
@@ -285,38 +320,13 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
 
         required_start = scene.continuity.required_start_state
 
-        if index == 0:
+        if required_start.strip().lower() in {"null", "none", ""}:
+            raise ValueError(
+                f"{scene.id} must have a concrete required_start_state."
+            )
 
-            if required_start.lower() in {
-                "null",
-                "none",
-                "",
-            }:
-                pass
-
-        else:
-
+        if index > 0:
             previous_scene = scenes[index - 1]
-
-            if required_start.lower() in {
-                "null",
-                "none",
-                "",
-            }:
-                raise ValueError(
-                    f"{scene.id} must have a real "
-                    "required_start_state."
-                )
-
-            if previous_scene.continuity.ending_state.lower() in {
-                "null",
-                "none",
-                "",
-            }:
-                raise ValueError(
-                    f"{previous_scene.id} must have a real "
-                    "ending_state."
-                )
 
             # Reject references like:
             # SCENE_001.ending_state
@@ -331,10 +341,8 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
         # ENDING STATE
         # ---------------------------------------------
 
-        if scene.continuity.ending_state.lower() in {
-            "null",
-            "none",
-            "",
+        if scene.continuity.ending_state.strip().lower() in {
+            "null", "none", "",
         }:
             raise ValueError(
                 f"{scene.id} must have a real ending_state."
@@ -344,10 +352,8 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
         # CHARACTER STATE
         # ---------------------------------------------
 
-        if scene.continuity.character_state.lower() in {
-            "null",
-            "none",
-            "",
+        if scene.continuity.character_state.strip().lower() in {
+            "null", "none", "",
         }:
             raise ValueError(
                 f"{scene.id} must have a real character_state."
@@ -357,10 +363,8 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
         # ENVIRONMENT STATE
         # ---------------------------------------------
 
-        if scene.continuity.environment_state.lower() in {
-            "null",
-            "none",
-            "",
+        if scene.continuity.environment_state.strip().lower() in {
+            "null", "none", "",
         }:
             raise ValueError(
                 f"{scene.id} must have a real environment_state."

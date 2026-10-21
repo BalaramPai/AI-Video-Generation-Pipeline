@@ -1,7 +1,10 @@
 import base64
+import hashlib
+import json
 import logging
 import mimetypes
 import random
+import shutil
 import time
 from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
@@ -53,6 +56,14 @@ def _fit_runway_prompt(prompt: str) -> str:
     normalized = " ".join(prompt.split())
     if _utf16_length(normalized) <= RUNWAY_PROMPT_MAX_CHARACTERS:
         return normalized
+    logger.warning(
+        "Runway prompt exceeded its character limit and trailing optional "
+        "context was removed",
+        extra={
+            "original_utf16_length": _utf16_length(normalized),
+            "maximum_utf16_length": RUNWAY_PROMPT_MAX_CHARACTERS,
+        },
+    )
 
     fitted: list[str] = []
     length = 0
@@ -190,6 +201,35 @@ class RunwayVideoGenerationProvider(VideoGenerationProvider):
                 f"{aspect_ratio!r} for image-to-video."
             )
 
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        task_state_path = output.with_name(
+            f"{output.stem}.runway-task.json"
+        )
+        input_snapshot_path = output.with_name(
+            f"{output.stem}.runway-input{Path(first_frame).suffix}"
+        )
+        request_fingerprint = self._request_fingerprint(
+            prompt=prompt,
+            duration_seconds=requested_duration,
+            aspect_ratio=aspect_ratio,
+        )
+        saved_task = self._load_saved_task(
+            task_state_path,
+            request_fingerprint,
+        )
+        if saved_task is not None:
+            saved_snapshot = Path(saved_task["input_snapshot"])
+            if not saved_snapshot.is_file():
+                raise VideoProviderError(
+                    "resume",
+                    f"saved input frame is missing: {saved_snapshot}",
+                    retryable=False,
+                    provider=self.name,
+                )
+            shutil.copyfile(saved_snapshot, first_frame)
+            input_snapshot_path = saved_snapshot
+
         payload: dict[str, str | int] = {
             "model": self._model,
             "promptImage": _image_data_uri(Path(first_frame)),
@@ -201,8 +241,6 @@ class RunwayVideoGenerationProvider(VideoGenerationProvider):
         else:
             payload["resolution"] = "720p"
 
-        output = Path(output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self._timeout_seconds
         headers = {
             "Authorization": f"Bearer {self._api_secret}",
@@ -228,10 +266,63 @@ class RunwayVideoGenerationProvider(VideoGenerationProvider):
         )
         with client_context as client:
             assert client is not None
-            task_id = self._submit(client, payload, headers)
-            task = self._poll(client, task_id, headers, deadline, cancel_event)
-            output_url = self._get_output_url(task)
-            self._download_video(client, output_url, output, deadline)
+            if saved_task is None:
+                task_id = self._submit(client, payload, headers)
+                shutil.copyfile(first_frame, input_snapshot_path)
+                self._save_task_state(
+                    task_state_path,
+                    {
+                        "task_id": task_id,
+                        "model": self._model,
+                        "request_fingerprint": request_fingerprint,
+                        "input_snapshot": str(input_snapshot_path),
+                    },
+                )
+                print(
+                    f"Runway task {task_id} submitted for {output.name}. "
+                    "Waiting for completion; the task is saved so it can "
+                    "resume if this run is interrupted."
+                )
+            else:
+                task_id = str(saved_task["task_id"])
+                print(
+                    f"Resuming Runway task {task_id} for {output.name}; "
+                    "no new generation request will be submitted."
+                )
+            try:
+                task = self._poll(
+                    client,
+                    task_id,
+                    headers,
+                    deadline,
+                    cancel_event,
+                )
+                output_url = self._get_output_url(task)
+                self._download_video(client, output_url, output, deadline)
+            except VideoGenerationTimeout:
+                print(
+                    f"Runway task {task_id} did not finish polling or "
+                    f"downloading before the local timeout. Its state remains "
+                    f"saved in {task_state_path}; rerun with the same "
+                    "storyboard and output directory to resume without "
+                    "submitting another task."
+                )
+                raise
+            except KeyboardInterrupt:
+                print(
+                    f"\nRunway task {task_id} may continue remotely. "
+                    f"Task state is saved in {task_state_path}; rerun with "
+                    "the same storyboard and output directory to resume it."
+                )
+                raise
+            except VideoProviderError as exc:
+                if exc.operation == "generation" and not exc.retryable:
+                    self._remove_task_state(
+                        task_state_path,
+                        input_snapshot_path,
+                    )
+                raise
+            self._remove_task_state(task_state_path, input_snapshot_path)
 
         return VideoGenerationResult(
             video_path=output,
@@ -244,6 +335,94 @@ class RunwayVideoGenerationProvider(VideoGenerationProvider):
                 "requested_duration_seconds": requested_duration,
             },
         )
+
+    def _request_fingerprint(
+        self,
+        *,
+        prompt: str,
+        duration_seconds: int,
+        aspect_ratio: str,
+    ) -> str:
+        request = json.dumps(
+            {
+                "model": self._model,
+                "prompt": prompt,
+                "duration_seconds": duration_seconds,
+                "aspect_ratio": aspect_ratio,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(request.encode("utf-8")).hexdigest()
+
+    def _load_saved_task(
+        self,
+        path: Path,
+        request_fingerprint: str,
+    ) -> dict[str, str] | None:
+        if not path.exists():
+            return None
+        try:
+            task_state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise VideoProviderError(
+                "resume",
+                f"could not read saved Runway task state {path}: {exc}",
+                retryable=False,
+                provider=self.name,
+            ) from exc
+        if not isinstance(task_state, dict):
+            raise VideoProviderError(
+                "resume",
+                f"saved Runway task state is invalid: {path}",
+                retryable=False,
+                provider=self.name,
+            )
+        task_id = task_state.get("task_id")
+        input_snapshot = task_state.get("input_snapshot")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise VideoProviderError(
+                "resume",
+                f"saved Runway task ID is invalid: {path}",
+                retryable=False,
+                provider=self.name,
+            )
+        if task_state.get("request_fingerprint") != request_fingerprint:
+            raise VideoProviderError(
+                "resume",
+                f"a Runway task is already saved in {path}, but the model, "
+                "prompt, duration, or aspect ratio has changed. To avoid "
+                "accidentally submitting a duplicate paid task, check the "
+                "original task first; remove the task-state file only after "
+                "you decide not to resume it.",
+                retryable=False,
+                provider=self.name,
+            )
+        if not isinstance(input_snapshot, str) or not input_snapshot.strip():
+            raise VideoProviderError(
+                "resume",
+                f"saved Runway input-frame path is invalid: {path}",
+                retryable=False,
+                provider=self.name,
+            )
+        return task_state
+
+    @staticmethod
+    def _save_task_state(path: Path, task_state: dict[str, str]) -> None:
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temporary_path.write_text(
+                json.dumps(task_state, indent=2),
+                encoding="utf-8",
+            )
+            temporary_path.replace(path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _remove_task_state(path: Path, input_snapshot: Path) -> None:
+        path.unlink(missing_ok=True)
+        input_snapshot.unlink(missing_ok=True)
 
     @staticmethod
     def _normalize_duration(
@@ -311,6 +490,9 @@ class RunwayVideoGenerationProvider(VideoGenerationProvider):
         deadline: float,
         cancel_event: Event | None,
     ) -> dict[str, Any]:
+        started_at = time.monotonic()
+        last_status: str | None = None
+        last_reported_at = started_at
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 raise VideoGenerationCancelled(provider=self.name)
@@ -358,6 +540,18 @@ class RunwayVideoGenerationProvider(VideoGenerationProvider):
             body = self._response_json(response, "poll")
             self._raise_for_api_error(response, body, "poll")
             status = body.get("status")
+            now = time.monotonic()
+            if (
+                status != last_status
+                or now - last_reported_at >= 30
+            ):
+                elapsed = int(now - started_at)
+                print(
+                    f"Runway task {task_id}: {status or 'unknown'} "
+                    f"({elapsed}s elapsed)."
+                )
+                last_status = status
+                last_reported_at = now
             if status == "SUCCEEDED":
                 return body
             if status in _TERMINAL_FAILURE_STATES:
