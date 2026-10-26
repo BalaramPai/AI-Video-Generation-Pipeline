@@ -4,6 +4,8 @@ from pathlib import Path
 from threading import Event
 from typing import Sequence
 
+from PIL import Image, UnidentifiedImageError
+
 from app.config import (
     VIDEO_PROVIDER,
 )
@@ -17,6 +19,28 @@ from app.video.providers.factory import create_video_provider
 
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_first_frame_image(image: Path) -> tuple[int, int]:
+    if not image.is_file():
+        raise FileNotFoundError(f"Scene image not found: {image}")
+    if image.stat().st_size <= 0:
+        raise ValueError(f"Scene image is empty: {image}")
+    try:
+        with Image.open(image) as candidate:
+            candidate.verify()
+        with Image.open(image) as candidate:
+            width, height = candidate.size
+            candidate.load()
+    except (OSError, UnidentifiedImageError, ValueError) as exc:
+        raise ValueError(
+            f"Scene image is not a readable image: {image}"
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"Scene image has invalid dimensions {width}x{height}: {image}"
+        )
+    return width, height
 
 
 def generate_scene_video(
@@ -33,11 +57,7 @@ def generate_scene_video(
     normalize_output: bool = True,
 ) -> str:
     image = Path(image_path)
-
-    if not image.exists():
-        raise FileNotFoundError(
-            f"Scene image not found: {image}"
-        )
+    image_width, image_height = _validate_first_frame_image(image)
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -94,6 +114,8 @@ def generate_scene_video(
                 "aspect_ratio": aspect_ratio,
                 "prompt": prompt,
                 "first_frame": str(image),
+                "first_frame_width": image_width,
+                "first_frame_height": image_height,
                 "last_frame": (
                     str(last_frame_path) if last_frame_path else None
                 ),

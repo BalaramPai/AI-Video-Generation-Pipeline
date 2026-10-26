@@ -15,6 +15,7 @@ from app.video.providers import (
 )
 from app.video.providers.runway import (
     RUNWAY_API_VERSION,
+    RUNWAY_MODEL_PROMPT_MAX_CHARACTERS,
     RUNWAY_PROMPT_MAX_CHARACTERS,
     _fit_runway_prompt,
 )
@@ -215,15 +216,39 @@ def test_runway_rejects_missing_key_and_unknown_model():
 
 
 def test_runway_prompt_limit_counts_utf16_code_units():
-    fitted = _fit_runway_prompt("🎬 scene continuity " * 150)
+    fitted = _fit_runway_prompt(" 🎬 scene continuity ")
+    assert fitted == "🎬 scene continuity"
+    assert len(fitted.encode("utf-16-le")) // 2 < RUNWAY_PROMPT_MAX_CHARACTERS
 
-    assert fitted.endswith("...")
-    assert len(fitted.encode("utf-16-le")) // 2 <= RUNWAY_PROMPT_MAX_CHARACTERS
+    overlong = "🎬" * (RUNWAY_PROMPT_MAX_CHARACTERS // 2 + 1)
+    with pytest.raises(ValueError, match="UTF-16 characters"):
+        _fit_runway_prompt(overlong)
 
-    long_token = "x" * (RUNWAY_PROMPT_MAX_CHARACTERS + 10)
-    fitted_token = _fit_runway_prompt(long_token)
-    assert fitted_token.startswith("x")
-    assert len(fitted_token) == RUNWAY_PROMPT_MAX_CHARACTERS
+    grok_prompt = "x" * 2000
+    assert _fit_runway_prompt(
+        grok_prompt,
+        "grok_imagine_1_5",
+    ) == grok_prompt
+    assert RUNWAY_MODEL_PROMPT_MAX_CHARACTERS["grok_imagine_1_5"] == 2500
+
+
+def test_runway_rejects_overlong_prompt_before_submitting_task(tmp_path):
+    image_path = tmp_path / "scene.png"
+    image_path.write_bytes(b"mock image bytes")
+    transport = httpx.MockTransport(
+        lambda request: pytest.fail(
+            f"Overlong prompt must not be submitted: {request.url}"
+        )
+    )
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(ValueError, match="will not be truncated"):
+            _provider(client).generate_video(
+                prompt="x" * (RUNWAY_PROMPT_MAX_CHARACTERS + 1),
+                output_path=tmp_path / "scene.mp4",
+                duration_seconds=5,
+                first_frame=image_path,
+            )
 
 
 def test_runway_rejects_separate_reference_images_without_api_request(tmp_path):

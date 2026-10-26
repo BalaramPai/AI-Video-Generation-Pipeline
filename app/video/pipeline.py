@@ -1,6 +1,5 @@
 import json
 import logging
-import math
 import re
 from fractions import Fraction
 from pathlib import Path
@@ -14,6 +13,7 @@ from app.assets.image_generator import (
     generate_scene_image_from_reference,
 )
 from app.config import (
+    IMAGE_TO_IMAGE_STRENGTH,
     RUNWAY_MODEL,
     VEO_MODEL,
     VIDEO_PROVIDER,
@@ -59,191 +59,22 @@ def _fit_required_motion_prompt(
     character_length: Callable[[str], int],
 ) -> str:
     normalized = [" ".join(component.split()) for component in components]
-    if character_length(" ".join(normalized)) <= maximum_characters:
-        return " ".join(normalized)
-
-    labeled_components: list[tuple[str, list[str]]] = []
-    for component in normalized:
-        label, separator, body = component.partition(":")
-        labeled_components.append(
-            (f"{label}:" if separator else "", body.strip().split())
-        )
-
-    separator_length = character_length(" ") * (len(labeled_components) - 1)
-    label_length = sum(
-        character_length(label) for label, _ in labeled_components
-    )
-    label_body_separator_length = sum(
-        character_length(" ")
-        for label, words in labeled_components
-        if label and words
-    )
-    content_budget = (
-        maximum_characters
-        - separator_length
-        - label_length
-        - label_body_separator_length
-    )
-    if content_budget <= 0:
-        raise ValueError(
-            "Runway motion prompt cannot fit its required section labels "
-            f"within {maximum_characters} characters."
-        )
-
-    weights = (0.14, 0.20, 0.18, 0.18, 0.12, 0.05, 0.12, 0.01)
-    budgets = [
-        math.floor(content_budget * weight)
-        for weight in weights[:len(labeled_components)]
-    ]
-    for index in range(len(budgets)):
-        budgets[index] += min(
-            content_budget - sum(budgets),
-            1 if sum(budgets) < content_budget else 0,
-        )
-
-    def truncate_at_word_boundary(value: str, budget: int) -> str:
-        if character_length(value) <= budget:
-            return value
-        ellipsis = "..."
-        fitted: list[str] = []
-        for word in value.split():
-            candidate = " ".join((*fitted, word, ellipsis))
-            if character_length(candidate) > budget:
-                break
-            fitted.append(word)
-        if not fitted:
-            return ""
-        return " ".join((*fitted, ellipsis))
-
-    def fit_negative_clauses(value: str, budget: int) -> tuple[str, list[str]]:
-        clauses = [
-            clause.strip()
-            for clause in re.split(r"[,;]", value)
-            if clause.strip()
-        ]
-        clauses = [
-            clause
-            if re.match(r"^(no|not|without|avoid)\b", clause, re.IGNORECASE)
-            else f"No {clause}"
-            for clause in clauses
-        ]
-
-        def priority(clause: str) -> int:
-            normalized_clause = clause.casefold()
-            if any(
-                keyword in normalized_clause
-                for keyword in ("camera", "cut", "transition")
-            ):
-                return 0
-            if any(
-                keyword in normalized_clause
-                for keyword in ("reverse", "upward", "backward", "direction")
-            ):
-                return 1
-            if any(
-                keyword in normalized_clause
-                for keyword in (
-                    "different",
-                    "extra",
-                    "missing",
-                    "rearranged",
-                    "position",
-                    "geometry",
-                    "shape",
-                    "reset",
-                    "teleport",
-                    "layer",
-                )
-            ):
-                return 2
-            return 3
-
-        clauses = [
-            clause
-            for _, clause in sorted(
-                enumerate(clauses),
-                key=lambda item: (priority(item[1]), item[0]),
-            )
-        ]
-        fitted: list[str] = []
-        omitted: list[str] = []
-        for clause in clauses:
-            candidate = "; ".join((*fitted, clause))
-            if character_length(candidate) <= budget:
-                fitted.append(clause)
-            else:
-                omitted.append(clause)
-        return "; ".join(fitted), omitted
-
-    def fit_component(
-        index: int,
-        budget: int,
-    ) -> tuple[str, list[str]]:
-        label, words = labeled_components[index]
-        original = " ".join(words)
-        if label.casefold() == "avoid:":
-            return fit_negative_clauses(original, budget)
-        return truncate_at_word_boundary(original, budget), []
-
-    fitted_contents: list[str] = []
-    omitted_by_component: list[list[str]] = []
-    for index in range(len(labeled_components)):
-        fitted, omitted = fit_component(index, budgets[index])
-        fitted_contents.append(fitted)
-        omitted_by_component.append(omitted)
-
-    unused_budget = content_budget - sum(
-        character_length(content) for content in fitted_contents
-    )
-    for index in range(len(labeled_components)):
-        if unused_budget <= 0:
-            break
-        previous_length = character_length(fitted_contents[index])
-        expanded, omitted = fit_component(
-            index,
-            budgets[index] + unused_budget,
-        )
-        added_characters = (
-            character_length(expanded) - previous_length
-        )
-        if added_characters > 0:
-            budgets[index] += unused_budget
-            fitted_contents[index] = expanded
-            omitted_by_component[index] = omitted
-            unused_budget -= added_characters
-
-    fitted_components: list[str] = []
-    shortened_components: list[str] = []
-    omitted_negative_constraints: list[str] = []
-    for index, (label, words) in enumerate(labeled_components):
-        original = " ".join(words)
-        fitted = fitted_contents[index]
-        omitted_negative_constraints.extend(omitted_by_component[index])
-        if character_length(fitted) < character_length(original):
-            shortened_components.append(label.rstrip(":") or f"detail {index + 1}")
-        fitted_components.append(" ".join(part for part in (label, fitted) if part))
-
-    prompt = " ".join(component for component in fitted_components if component)
+    prompt = " ".join(component for component in normalized if component)
     if character_length(prompt) > maximum_characters:
         raise ValueError(
-            "Runway motion prompt could not be compacted safely below "
-            f"{maximum_characters} characters."
+            "Required Runway motion details exceed the provider limit; "
+            "shorten the subject, starting state, action, ending state, or "
+            f"camera instructions to fit within {maximum_characters} "
+            "UTF-16 characters. Required details were not truncated."
         )
-    logger.warning(
-        "Required Runway prompt content exceeded the provider character "
-        "limit; selected fields were shortened and complete negative "
-        "constraints that did not fit were omitted. Inspect the saved prompt "
-        "and shorten these storyboard fields for best results.",
-        extra={
-            "shortened_components": shortened_components,
-            "omitted_negative_constraints": omitted_negative_constraints,
-            "maximum_characters": maximum_characters,
-        },
-    )
     return prompt
 
 
-def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
+def _build_motion_prompt(
+    storyboard: Storyboard,
+    scene: Scene,
+    compilation_diagnostics: dict | None = None,
+) -> str:
     location = next(
         location for location in storyboard.locations
         if location.id == scene.location_id
@@ -299,7 +130,7 @@ def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
             "composition; animate only this action naturally."
         )
     )
-    required_components = [
+    core_components = [
         subject_instruction,
         f"Starting state: {scene.continuity.required_start_state}.",
         f"Action: {scene.action}.",
@@ -308,13 +139,15 @@ def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
             f"Camera: {scene.camera.shot_type}, {scene.camera.angle}, "
             f"{scene.camera.movement}, {scene.camera.lens or 'natural lens'}."
         ),
+    ]
+    required_components = [
+        *core_components,
         f"Visual: {scene.visual_description}.",
         f"Avoid: {negative}.",
-        "One continuous shot.",
     ]
     required_prompt = " ".join(required_components)
     if VIDEO_PROVIDER != "runway":
-        return (
+        prompt = (
             f"{required_prompt} "
             f"Visual style: {storyboard.project.visual_style}. "
             f"Location: {location.name}, {location.lighting}. "
@@ -326,23 +159,84 @@ def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
             f"Continuity: {scene.visual_continuity}. "
             f"{appearance_instruction}"
         )
+        if compilation_diagnostics is not None:
+            compilation_diagnostics.update(
+                {
+                    "video_prompt_character_count": len(prompt),
+                    "video_prompt_character_limit": None,
+                    "video_prompt_character_count_unit": (
+                        "Unicode code points; provider-specific limit "
+                        "not declared"
+                    ),
+                    "video_prompt_omitted_context": [],
+                    "video_prompt_omitted_negative_constraints": [],
+                }
+            )
+        return prompt
 
     from app.video.providers.runway import (
         RUNWAY_PROMPT_MAX_CHARACTERS,
+        RUNWAY_MODEL_PROMPT_MAX_CHARACTERS,
         _utf16_length,
     )
-
-    required_prompt = _fit_required_motion_prompt(
-        required_components,
+    maximum_prompt_characters = RUNWAY_MODEL_PROMPT_MAX_CHARACTERS.get(
+        RUNWAY_MODEL,
         RUNWAY_PROMPT_MAX_CHARACTERS,
-        _utf16_length,
     )
-    if _utf16_length(required_prompt) > RUNWAY_PROMPT_MAX_CHARACTERS:
-        raise ValueError(
-            f"{scene.id} motion prompt could not be safely fit within Runway's "
-            f"{RUNWAY_PROMPT_MAX_CHARACTERS}-character limit."
-        )
 
+    try:
+        required_prompt = _fit_required_motion_prompt(
+            core_components,
+            maximum_prompt_characters,
+            _utf16_length,
+        )
+    except ValueError as exc:
+        raise ValueError(f"{scene.id}: {exc}") from exc
+
+    def negative_priority(clause: str) -> int:
+        normalized = clause.casefold()
+        if any(word in normalized for word in ("camera", "cut", "transition")):
+            return 0
+        if any(
+            word in normalized
+            for word in (
+                "reverse",
+                "upward",
+                "backward",
+                "reset",
+                "teleport",
+                "different",
+                "extra",
+                "missing",
+                "rearranged",
+                "geometry",
+                "shape",
+                "layer",
+            )
+        ):
+            return 1
+        return 2
+
+    negative_clauses = [
+        clause.strip()
+        for clause in re.split(r"[,;]", negative)
+        if clause.strip()
+    ]
+    negative_clauses = [
+        clause
+        if re.match(r"^(no|not|without|avoid)\b", clause, re.IGNORECASE)
+        else f"No {clause}"
+        for clause in negative_clauses
+    ]
+    negative_clauses = [
+        clause
+        for _, clause in sorted(
+            enumerate(negative_clauses),
+            key=lambda item: (negative_priority(item[1]), item[0]),
+        )
+    ]
+
+    priority_components = [f"Visual: {scene.visual_description}."]
     optional_components = [
         f"Relevant props: {prop_lock}." if prop_lock else "",
         f"Blocking: {scene.blocking}." if scene.blocking else "",
@@ -360,34 +254,76 @@ def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
     ]
     prompt = required_prompt
     omitted_context: list[str] = []
+    omitted_negative_constraints: list[str] = []
+    fitted_negative: list[str] = []
+    for clause in negative_clauses:
+        candidate_clauses = [*fitted_negative, clause]
+        candidate = (
+            f"{prompt} Avoid: {'; '.join(candidate_clauses)}"
+        )
+        if _utf16_length(candidate) <= maximum_prompt_characters:
+            fitted_negative.append(clause)
+        else:
+            omitted_negative_constraints.append(clause)
+    if fitted_negative:
+        prompt = f"{prompt} Avoid: {'; '.join(fitted_negative)}"
+    for component in priority_components:
+        if not component:
+            continue
+        candidate = f"{prompt} {component}"
+        if _utf16_length(candidate) <= maximum_prompt_characters:
+            prompt = candidate
+        else:
+            omitted_context.append(component.split(":", 1)[0])
     for component in optional_components:
         if not component:
             continue
         candidate = f"{prompt} {component}"
-        if _utf16_length(candidate) <= RUNWAY_PROMPT_MAX_CHARACTERS:
+        if _utf16_length(candidate) <= maximum_prompt_characters:
             prompt = candidate
         else:
             omitted_context.append(component.split(":", 1)[0])
     final_character_count = _utf16_length(prompt)
-    if final_character_count > RUNWAY_PROMPT_MAX_CHARACTERS:
+    if final_character_count > maximum_prompt_characters:
         raise ValueError(
             f"{scene.id} assembled motion prompt is "
             f"{final_character_count} UTF-16 characters; Runway supports "
-            f"{RUNWAY_PROMPT_MAX_CHARACTERS}."
+            f"{maximum_prompt_characters} for {RUNWAY_MODEL}."
         )
     logger.info(
         "Final assembled Runway motion prompt",
         extra={
             "scene_id": scene.id,
             "character_count": final_character_count,
-            "maximum_characters": RUNWAY_PROMPT_MAX_CHARACTERS,
+            "maximum_characters": maximum_prompt_characters,
         },
     )
     if omitted_context:
         logger.info(
-            "Optional Runway prompt context omitted to preserve the complete "
-            "scene action and state",
+            "Optional Runway prompt context omitted to preserve required "
+            "subject, action, state, and camera details",
             extra={"scene_id": scene.id, "omitted_context": omitted_context},
+        )
+    if omitted_negative_constraints:
+        logger.warning(
+            "Runway prompt negative constraints omitted as complete clauses "
+            "because the provider limit was reached",
+            extra={
+                "scene_id": scene.id,
+                "omitted_negative_constraints": omitted_negative_constraints,
+            },
+        )
+    if compilation_diagnostics is not None:
+        compilation_diagnostics.update(
+            {
+                "video_prompt_character_count": final_character_count,
+                "video_prompt_character_limit": maximum_prompt_characters,
+                "video_prompt_character_count_unit": "UTF-16 code units",
+                "video_prompt_omitted_context": omitted_context,
+                "video_prompt_omitted_negative_constraints": (
+                    omitted_negative_constraints
+                ),
+            }
         )
     return prompt
 
@@ -439,7 +375,9 @@ def generate_video_from_storyboard(
                 "aspect_ratio": storyboard.project.aspect_ratio,
                 "num_inference_steps": 35,
                 "guidance_scale": 6.5,
-                "image_to_image_strength": 0.30 if index > 0 else None,
+                "image_to_image_strength": (
+                    IMAGE_TO_IMAGE_STRENGTH if index > 0 else None
+                ),
             },
             "video_generation_parameters": {
                 "duration_seconds": scene.duration_seconds,
@@ -464,13 +402,20 @@ def generate_video_from_storyboard(
             "reference_frame_paths": [],
             "video_prompt": None,
             "video_prompt_path": str(motion_prompt_path),
+            "video_prompt_character_count": None,
+            "video_prompt_character_limit": None,
+            "video_prompt_character_count_unit": None,
+            "video_prompt_omitted_context": [],
+            "video_prompt_omitted_negative_constraints": [],
             "video_reference_images_requested": [],
             "scene_video_path": str(video_path),
             "generated_frame_count": None,
             "generated_frame_rate": None,
             "generated_duration_seconds": None,
             "generated_audio_codec": None,
+            "transition_strategy": "hard_cut",
         }
+        _write_scene_diagnostics(diagnostics_path, diagnostics)
         if index > 0:
             previous_scene = storyboard.scenes[index - 1]
             previous_ending_state = previous_scene.continuity.ending_state
@@ -541,16 +486,82 @@ def generate_video_from_storyboard(
                     "A previous scene video is required for continuity."
                 )
 
+            boundary = {
+                "previous_scene_id": storyboard.scenes[index - 1].id,
+                "next_scene_id": scene.id,
+                "source_video_path": previous_video,
+                "provider": VIDEO_PROVIDER,
+                "model": diagnostics["model"],
+                "status": "extracting_reference_frames",
+                "candidate_frames": [],
+                "selected_frame": None,
+                "img2img_input_path": None,
+                "img2img_output_path": str(image_path),
+                "provider_input_image_path": str(image_path),
+            }
+            diagnostics["continuity_boundary"] = boundary
+            _write_scene_diagnostics(diagnostics_path, diagnostics)
             reference_dir = output_directory / (
                 f"scene_{index:03d}_end_frames"
             )
-            reference_frames = build_continuity_reference(
-                extract_last_frames(
-                    video_path=previous_video,
-                    output_dir=str(reference_dir),
+            try:
+                source_info = probe_video(previous_video)
+                reference_frames = build_continuity_reference(
+                    extract_last_frames(
+                        video_path=previous_video,
+                        output_dir=str(reference_dir),
+                    )
                 )
-            )
+                candidate_frames = []
+                for frame in reference_frames:
+                    frame_path = Path(frame)
+                    frame_index = int(frame_path.stem.rsplit("_", 1)[-1])
+                    timestamp = (
+                        Fraction(frame_index, 1) / source_info.frame_rate
+                    )
+                    candidate_frames.append(
+                        {
+                            "path": str(frame_path),
+                            "frame_index": frame_index,
+                            "timestamp_seconds": float(timestamp),
+                        }
+                    )
+                boundary.update(
+                    {
+                        "status": "reference_selected",
+                        "source_video_duration_seconds": str(
+                            source_info.duration_seconds
+                        ),
+                        "source_video_frame_count": source_info.frame_count,
+                        "source_video_frame_rate": str(
+                            source_info.frame_rate
+                        ),
+                        "candidate_timestamp_basis": (
+                            "frame_index / normalized CFR frame rate"
+                        ),
+                        "candidate_frames": candidate_frames,
+                    }
+                )
+            except Exception as exc:
+                boundary["status"] = "reference_extraction_failed"
+                boundary["error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _write_scene_diagnostics(diagnostics_path, diagnostics)
+                logger.exception(
+                    "Previous-scene reference extraction failed",
+                    extra={
+                        "previous_scene_id": boundary["previous_scene_id"],
+                        "scene_id": scene.id,
+                        "source_video": previous_video,
+                    },
+                )
+                raise
             continuity_references = (reference_frames[-1],)
+            selected_candidate = candidate_frames[-1]
+            boundary["selected_frame"] = selected_candidate
+            boundary["img2img_input_path"] = continuity_references[0]
+            boundary["img2img_strength"] = IMAGE_TO_IMAGE_STRENGTH
             diagnostics["reference_source_video_path"] = previous_video
             diagnostics["reference_frame_used_for_img2img"] = (
                 continuity_references[0]
@@ -592,8 +603,14 @@ def generate_video_from_storyboard(
                     aspect_ratio=storyboard.project.aspect_ratio,
                     negative_prompt=negative_prompt,
                     scene_id=scene.id,
+                    strength=IMAGE_TO_IMAGE_STRENGTH,
                 )
+                boundary["status"] = "img2img_completed"
+                boundary["img2img_output_path"] = str(image_path)
+                _write_scene_diagnostics(diagnostics_path, diagnostics)
             except Exception as exc:
+                boundary["status"] = "img2img_failed"
+                boundary["error"] = f"{type(exc).__name__}: {exc}"
                 diagnostics["error"] = (
                     f"Continuity image generation failed: "
                     f"{type(exc).__name__}: {exc}"
@@ -604,8 +621,26 @@ def generate_video_from_storyboard(
                     extra={"scene_id": scene.id},
                 )
                 raise
-
-        motion_prompt = _build_motion_prompt(storyboard, scene)
+        runway_task_state_path = video_path.with_name(
+                f"{video_path.stem}.runway-task.json"
+        )
+        try:
+            motion_prompt = _build_motion_prompt(
+                storyboard,
+                scene,
+                compilation_diagnostics=diagnostics,
+            )
+        except Exception as exc:
+            diagnostics["error"] = (
+                f"Motion prompt compilation failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            _write_scene_diagnostics(diagnostics_path, diagnostics)
+            logger.exception(
+                "Scene motion prompt compilation failed",
+                extra={"scene_id": scene.id},
+            )
+            raise
         diagnostics["video_prompt"] = motion_prompt
         motion_prompt_path.write_text(motion_prompt, encoding="utf-8")
         diagnostics["first_frame_image_path"] = str(image_path)
@@ -641,6 +676,17 @@ def generate_video_from_storyboard(
                 normalize_output=index != 0,
             )
         except KeyboardInterrupt:
+            if index > 0:
+                diagnostics["continuity_boundary"]["status"] = (
+                    "provider_task_pending_interrupted"
+                    if VIDEO_PROVIDER == "runway"
+                    and runway_task_state_path.is_file()
+                    else "provider_generation_interrupted"
+                )
+                if runway_task_state_path.is_file():
+                    diagnostics["continuity_boundary"][
+                        "pending_task_state_path"
+                    ] = str(runway_task_state_path)
             diagnostics["error"] = (
                 "Video generation interrupted. A submitted remote task may "
                 "still be running; check for its saved provider task state "
@@ -649,6 +695,23 @@ def generate_video_from_storyboard(
             _write_scene_diagnostics(diagnostics_path, diagnostics)
             raise
         except Exception as exc:
+            if index > 0:
+                pending_runway_task = (
+                    VIDEO_PROVIDER == "runway"
+                    and runway_task_state_path.is_file()
+                )
+                diagnostics["continuity_boundary"]["status"] = (
+                    "provider_task_pending"
+                    if pending_runway_task
+                    else "provider_generation_failed"
+                )
+                diagnostics["continuity_boundary"]["error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if pending_runway_task:
+                    diagnostics["continuity_boundary"][
+                        "pending_task_state_path"
+                    ] = str(runway_task_state_path)
             diagnostics["error"] = (
                 f"Video generation failed: {type(exc).__name__}: {exc}"
             )
@@ -673,6 +736,19 @@ def generate_video_from_storyboard(
             )
             previous_video = str(video_path)
         video_info = probe_video(previous_video)
+        if index > 0:
+            diagnostics["continuity_boundary"].update(
+                {
+                    "status": "completed",
+                    "provider_input_image_path": str(image_path),
+                    "normalized_video_path": previous_video,
+                    "normalized_frame_rate": str(video_info.frame_rate),
+                    "normalized_frame_count": video_info.frame_count,
+                    "normalized_duration_seconds": str(
+                        video_info.duration_seconds
+                    ),
+                }
+            )
         diagnostics["scene_video_path"] = previous_video
         diagnostics["generated_frame_count"] = video_info.frame_count
         diagnostics["generated_frame_rate"] = str(video_info.frame_rate)

@@ -34,6 +34,10 @@ _RUNWAY_MODELS = {
     "gen4.5": (2, 10),
     "grok_imagine_1_5": (1, 15),
 }
+RUNWAY_MODEL_PROMPT_MAX_CHARACTERS = {
+    "gen4.5": 1000,
+    "grok_imagine_1_5": 2500,
+}
 _GEN45_RATIOS = {
     "16:9": "1280:720",
     "9:16": "720:1280",
@@ -52,32 +56,19 @@ def _utf16_length(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
 
-def _fit_runway_prompt(prompt: str) -> str:
+def _fit_runway_prompt(prompt: str, model: str = "gen4.5") -> str:
     normalized = " ".join(prompt.split())
-    if _utf16_length(normalized) <= RUNWAY_PROMPT_MAX_CHARACTERS:
-        return normalized
-    logger.warning(
-        "Runway prompt exceeded its character limit and trailing optional "
-        "context was removed",
-        extra={
-            "original_utf16_length": _utf16_length(normalized),
-            "maximum_utf16_length": RUNWAY_PROMPT_MAX_CHARACTERS,
-        },
-    )
-
-    fitted: list[str] = []
-    length = 0
-    for character in normalized:
-        character_length = _utf16_length(character)
-        if length + character_length > RUNWAY_PROMPT_MAX_CHARACTERS - 3:
-            break
-        fitted.append(character)
-        length += character_length
-
-    compact = "".join(fitted).rstrip()
-    if " " in compact:
-        compact = compact.rsplit(" ", 1)[0].rstrip()
-    return f"{compact}..."
+    character_count = _utf16_length(normalized)
+    maximum_characters = RUNWAY_MODEL_PROMPT_MAX_CHARACTERS.get(model)
+    if maximum_characters is None:
+        raise ValueError(f"Unsupported Runway prompt model: {model!r}.")
+    if character_count > maximum_characters:
+        raise ValueError(
+            f"Runway prompt is {character_count} UTF-16 characters; the "
+            f"maximum for {model} is {maximum_characters}. Prompt text will "
+            "not be truncated by the provider adapter."
+        )
+    return normalized
 
 
 def _image_data_uri(image_path: Path) -> str:
@@ -233,7 +224,7 @@ class RunwayVideoGenerationProvider(VideoGenerationProvider):
         payload: dict[str, str | int] = {
             "model": self._model,
             "promptImage": _image_data_uri(Path(first_frame)),
-            "promptText": _fit_runway_prompt(prompt),
+            "promptText": _fit_runway_prompt(prompt, self._model),
             "duration": generation_duration,
         }
         if self._model == "gen4.5":

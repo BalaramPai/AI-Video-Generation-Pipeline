@@ -22,6 +22,13 @@ continuity between scenes, and joins the generated clips into one MP4.
 
    The secret is sent only to Runway's API and must not be committed.
 
+      Img2img continuity strength defaults to `0.30`. It can be varied between
+      `0.0` and `1.0` for controlled experiments without changing code:
+
+      ```text
+      IMAGE_TO_IMAGE_STRENGTH=0.30
+      ```
+
 4. Choose the provider and model in `.env`:
 
    ```text
@@ -116,11 +123,14 @@ motion prompts repeat the start state, blocking, prop state, and end state and
 explicitly exclude identity morphing, extra limbs, duplicate people, costume
 changes, prop teleportation, flicker, and sudden cuts.
 
-Runway motion prompts also fit its 1,000 UTF-16-character limit. If required
-scene fields exceed it, prompt text is shortened at word boundaries across
-the subject, start state, action, ending state, visual description, camera,
-and avoid instructions; a warning identifies the shortened sections. Keep
-these fields concise to avoid losing useful detail.
+Runway motion prompts use the model-specific limits from the Runway API
+schema: 1,000 UTF-16 code units for Gen-4.5 and 2,500 for Grok Imagine 1.5.
+The compiler keeps the subject, starting state, action, ending state, and
+camera instructions complete; it prioritizes complete negative clauses and
+optional visual/context details after those fields. Omitted optional sections
+and negative constraints are reported. If the required core alone is too
+long, generation fails with a request to shorten the storyboard rather than
+truncating an essential instruction.
 
 Negative prompts are also kept within the model limit. Built-in quality and
 character safeguards take priority; comma- or semicolon-separated storyboard
@@ -149,10 +159,47 @@ Runway's API request does not contain a separate reference-image field. Keep
 each scene to one primary action, one camera movement, and a small number of
 characters and interacting props.
 
-The optional `VIDEO_PROVIDER=veo` setting keeps the Google Veo provider
-available; it requires `GEMINI_API_KEY` and uses the `VEO_*` settings in
-`.env.example`. Use `VIDEO_PROVIDER=ffmpeg` only for the local still-image
-motion fallback; it is not AI-generated motion.
+The current Runway Gen-4.5 and Grok Imagine 1.5 integration uses the
+image-to-video endpoint and cannot take a preceding video as temporal
+continuation input. The current Runway OpenAPI schema has a separate
+video-to-video `extend` mode for `gemini_omni_flash_1.1`; that is a different
+model and API operation and is not wired into this pipeline. Do not describe
+the current Gen-4.5/Grok scene-by-scene workflow as provider-level temporal
+continuation.
+
+Each later scene's `scene_NNN_generation.json` also records the previous and
+next scene IDs, source video timing, extracted candidate frame indexes and
+timestamps, selected reference, img2img input/output, provider input image,
+effective img2img strength, and transition status. Candidate timestamps are
+calculated from decoded frame indexes and the normalized constant frame rate.
+The final MP4 currently uses hard cuts; no crossfade is applied automatically.
+This keeps transitions from hiding incompatible poses or motion.
+
+### Evaluating continuity changes
+
+The automated suite verifies file handoffs and timing, not perceived motion
+quality. For a visual comparison, use the same storyboard, provider, model,
+scene durations, and prompt text in separate output directories. Change only
+one setting at a time (for example, `IMAGE_TO_IMAGE_STRENGTH=0.20`, `0.30`,
+or `0.40`), and expect each Runway run to incur generation cost. The pipeline
+does not launch these paid comparisons automatically.
+
+For every scene boundary, inspect the last two seconds of the preceding clip
+and the first two seconds of the next clip, then watch the complete output.
+Record the storyboard version, provider/model, strength, selected reference
+frame, prompt files, approximate cost, identity/pose changes, motion
+direction, camera and lighting changes, flicker, and final duration. A still
+frame that resembles the boundary does not prove that motion continues
+smoothly.
+
+The code retains an optional `VIDEO_PROVIDER=veo` integration; it requires
+`GEMINI_API_KEY` and uses the `VEO_*` settings in `.env.example`. The current
+Google Gemini video documentation states that the Veo 3.1 Preview in the
+Gemini API has been shut down, so this older configured preview integration
+may no longer be available. Check current Google documentation before using
+it. Use
+`VIDEO_PROVIDER=ffmpeg` only for the local still-image motion fallback; it is
+not AI-generated motion.
 
 ## Local fallback
 

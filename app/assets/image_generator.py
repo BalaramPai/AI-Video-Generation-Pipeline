@@ -6,6 +6,7 @@ from typing import Sequence
 import torch
 from diffusers import StableDiffusionPipeline
 
+from app.config import IMAGE_TO_IMAGE_STRENGTH
 from app.storyboard.models import (
     Prop,
     Storyboard,
@@ -449,8 +450,13 @@ def generate_scene_image_from_reference(
     aspect_ratio: str = "16:9",
     negative_prompt: str | None = None,
     scene_id: str | None = None,
+    strength: float = IMAGE_TO_IMAGE_STRENGTH,
 ) -> str:
 
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError(
+            "IMAGE_TO_IMAGE_STRENGTH must be between 0.0 and 1.0."
+        )
     effective_negative_prompt = negative_prompt or IMAGE_NEGATIVE_PROMPT
     _validate_pipeline_prompts(prompt, effective_negative_prompt, TOKENIZER)
 
@@ -489,7 +495,7 @@ def generate_scene_image_from_reference(
             "output_image_path": str(output),
             "image_prompt": prompt,
             "negative_prompt": effective_negative_prompt,
-            "strength": 0.30,
+            "strength": strength,
         },
     )
     with Image.open(reference) as reference_image:
@@ -503,7 +509,7 @@ def generate_scene_image_from_reference(
         height=height,
         # A low denoise strength preserves the reference identity and
         # composition instead of redrawing the subject from scratch.
-        strength=0.30,
+        strength=strength,
         guidance_scale=6.5,
         num_inference_steps=35,
     ).images[0]

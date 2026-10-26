@@ -121,9 +121,8 @@ def test_motion_prompt_preserves_required_scene_content_before_optional_style(
     assert "educational style educational style" not in prompt
 
 
-def test_motion_prompt_fits_overlong_required_content_and_warns(
+def test_motion_prompt_fails_instead_of_truncating_required_action(
     monkeypatch,
-    caplog,
 ):
     storyboard = _circuit_storyboard()
     scene = storyboard.scenes[0]
@@ -132,30 +131,54 @@ def test_motion_prompt_fits_overlong_required_content_and_warns(
         "No camera movement; no cuts; no extra filters."
     )
     monkeypatch.setattr(pipeline, "VIDEO_PROVIDER", "runway")
+    with pytest.raises(
+        ValueError,
+        match="Required Runway motion details exceed the provider limit",
+    ):
+        pipeline._build_motion_prompt(storyboard, scene)
+
+
+def test_grok_prompt_compiler_uses_its_verified_model_limit(monkeypatch):
+    storyboard = _circuit_storyboard()
+    scene = storyboard.scenes[0]
+    scene.action = "Continue the movement " * 70
+    monkeypatch.setattr(pipeline, "VIDEO_PROVIDER", "runway")
+    monkeypatch.setattr(pipeline, "RUNWAY_MODEL", "grok_imagine_1_5")
+
+    prompt = pipeline._build_motion_prompt(storyboard, scene)
+
+    assert scene.action in prompt
+    assert len(prompt.encode("utf-16-le")) // 2 <= 2500
+    assert len(prompt.encode("utf-16-le")) // 2 > 1000
+
+
+def test_motion_prompt_preserves_complete_core_and_priority_negatives(
+    monkeypatch,
+    caplog,
+):
+    storyboard = _circuit_storyboard()
+    scene = storyboard.scenes[0]
+    scene.negative_prompt = (
+        "No camera cuts; no reverse flow; no extra switches; no text."
+    )
+    scene.visual_description = "Detailed visual context " * 250
+    monkeypatch.setattr(pipeline, "VIDEO_PROVIDER", "runway")
     caplog.set_level("INFO", logger="app.video.pipeline")
 
     prompt = pipeline._build_motion_prompt(storyboard, scene)
-    character_count = len(prompt.encode("utf-16-le")) // 2
 
-    assert character_count <= 1000
-    assert "Starting state:" in prompt
-    assert "Action:" in prompt
-    assert "Ending state:" in prompt
-    assert "Visual:" in prompt
-    assert "Camera:" in prompt
-    assert "No camera movement" in prompt
-    assert "no cuts" in prompt
+    assert len(prompt.encode("utf-16-le")) // 2 <= 1000
+    assert scene.continuity.required_start_state in prompt
+    assert scene.action in prompt
+    assert scene.continuity.ending_state in prompt
+    assert scene.camera.movement in prompt
+    assert "No camera cuts" in prompt
+    assert "no reverse flow" in prompt
     assert any(
-        "shortened" in record.message.lower()
+        record.message == "Optional Runway prompt context omitted to preserve "
+        "required subject, action, state, and camera details"
         for record in caplog.records
     )
-    final_prompt_log = next(
-        record
-        for record in caplog.records
-        if record.message == "Final assembled Runway motion prompt"
-    )
-    assert final_prompt_log.character_count == character_count
-    assert final_prompt_log.maximum_characters == 1000
 
 
 def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
@@ -179,6 +202,7 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
     storyboard.scenes.append(scene_three)
     extracted_sources = []
     img2img_handoffs = []
+    img2img_strengths = []
     video_first_frames = []
 
     def fake_generate_image(**kwargs):
@@ -197,6 +221,7 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
 
     def fake_generate_from_reference(**kwargs):
         reference = Path(kwargs["reference_image_path"])
+        img2img_strengths.append(kwargs["strength"])
         with Image.open(reference) as image:
             image.load()
             img2img_handoffs.append((reference, image.getpixel((0, 0))))
@@ -295,6 +320,7 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
         (21, 30, 40),
         (22, 30, 40),
     ]
+    assert img2img_strengths == [pipeline.IMAGE_TO_IMAGE_STRENGTH] * 2
     scene_two_diagnostics = json.loads(
         (tmp_path / "scene_002_generation.json").read_text(encoding="utf-8")
     )
@@ -309,4 +335,39 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
     assert scene_two_diagnostics["first_frame_image_path"] == str(
         tmp_path / "scene_002.png"
     )
+    boundary = scene_two_diagnostics["continuity_boundary"]
+    assert boundary["status"] == "completed"
+    assert boundary["previous_scene_id"] == "SCENE_001"
+    assert boundary["next_scene_id"] == "SCENE_002"
+    assert boundary["candidate_frames"] == [
+        {
+            "path": str(
+                tmp_path / "scene_001_end_frames" / "frame_000119.png"
+            ),
+            "frame_index": 119,
+            "timestamp_seconds": pytest.approx(119 / 24),
+        }
+    ]
+    assert boundary["selected_frame"]["path"] == str(
+        tmp_path / "scene_001_end_frames" / "frame_000119.png"
+    )
+    assert boundary["source_video_frame_rate"] == "24"
+    assert boundary["candidate_timestamp_basis"] == (
+        "frame_index / normalized CFR frame rate"
+    )
+    assert boundary["img2img_input_path"] == str(
+        tmp_path / "scene_001_end_frames" / "frame_000119.png"
+    )
+    assert boundary["img2img_output_path"] == str(tmp_path / "scene_002.png")
+    assert boundary["provider_input_image_path"] == str(
+        tmp_path / "scene_002.png"
+    )
+    assert boundary["img2img_strength"] == pipeline.IMAGE_TO_IMAGE_STRENGTH
+    assert scene_two_diagnostics["video_prompt_character_count"] <= (
+        scene_two_diagnostics["video_prompt_character_limit"]
+    )
+    assert scene_two_diagnostics["video_prompt_character_count_unit"] == (
+        "UTF-16 code units"
+    )
+    assert scene_two_diagnostics["transition_strategy"] == "hard_cut"
     assert final_path.read_bytes() == b"final"

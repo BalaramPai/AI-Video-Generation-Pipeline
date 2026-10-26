@@ -2,6 +2,7 @@ from fractions import Fraction
 import logging
 
 import pytest
+from PIL import Image
 
 import app.video.generator as video_generator
 import app.video.providers.factory as video_provider_factory
@@ -25,6 +26,10 @@ from app.video.generator import (
     generate_scene_video,
 )
 from app.video import composer
+
+
+def _write_test_image(path, color=(1, 2, 3)):
+    Image.new("RGB", (16, 12), color).save(path)
 
 
 def test_build_scene_image_prompt_stays_under_sd15_token_limit():
@@ -125,7 +130,7 @@ def test_build_scene_image_prompt_stays_under_sd15_token_limit():
 
 def test_generate_scene_video_requires_gemini_key(monkeypatch, tmp_path):
     image_path = tmp_path / "scene.png"
-    image_path.write_bytes(b"image")
+    _write_test_image(image_path)
 
     monkeypatch.setattr(video_generator, "VIDEO_PROVIDER", "veo")
     monkeypatch.setattr(video_provider_factory, "GEMINI_API_KEY", None)
@@ -144,7 +149,7 @@ def test_generate_scene_video_normalizes_provider_duration(
     tmp_path,
 ):
     image_path = tmp_path / "scene.png"
-    image_path.write_bytes(b"image")
+    _write_test_image(image_path)
     output_path = tmp_path / "scene.mp4"
 
     class FakeProvider:
@@ -218,9 +223,9 @@ def test_generate_scene_video_uses_first_frame_when_provider_lacks_references(
     caplog,
 ):
     image_path = tmp_path / "scene.png"
-    image_path.write_bytes(b"image")
+    _write_test_image(image_path)
     reference_path = tmp_path / "previous.png"
-    reference_path.write_bytes(b"reference")
+    _write_test_image(reference_path, (4, 5, 6))
     output_path = tmp_path / "scene.mp4"
 
     class FakeProvider:
@@ -288,6 +293,27 @@ def test_generate_scene_video_uses_first_frame_when_provider_lacks_references(
     assert capability_log.first_frame == str(image_path)
     assert capability_log.reference_images_submitted == []
     assert capability_log.first_frame_is_uploaded_conditioning_image is True
+
+
+def test_generate_scene_video_rejects_corrupt_first_frame_before_provider(
+    monkeypatch,
+    tmp_path,
+):
+    image_path = tmp_path / "corrupt.png"
+    image_path.write_bytes(b"not a png")
+    monkeypatch.setattr(video_generator, "VIDEO_PROVIDER", "runway")
+    monkeypatch.setattr(
+        video_generator,
+        "create_video_provider",
+        lambda *_: pytest.fail("Provider must not receive an invalid image"),
+    )
+
+    with pytest.raises(ValueError, match="not a readable image"):
+        generate_scene_video(
+            image_path=str(image_path),
+            prompt="Continue the scene.",
+            output_path=str(tmp_path / "scene.mp4"),
+        )
 
 
 def test_trim_video_writes_normalized_output(monkeypatch, tmp_path):
