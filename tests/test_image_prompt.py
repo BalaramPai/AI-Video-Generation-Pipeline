@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from PIL import Image
 
@@ -473,19 +475,32 @@ def test_scene_image_generation_passes_validated_prompt_and_negative(
     output = tmp_path / "scene.png"
     prompt = "A red car with the hood open in a clean garage."
     negative_prompt = "low quality, no extra cars"
+    metadata_path = tmp_path / "scene_image_generation.json"
 
     image_generator.generate_scene_image(
         prompt=prompt,
         output_path=str(output),
         negative_prompt=negative_prompt,
         aspect_ratio="16:9",
+        metadata_path=metadata_path,
     )
 
     assert captured["prompt"] == prompt
     assert captured["negative_prompt"] == negative_prompt
     assert captured["width"] == 768
     assert captured["height"] == 432
+    assert captured["num_inference_steps"] == 35
+    assert captured["guidance_scale"] == 6.5
+    assert "generator" not in captured
     assert output.is_file()
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["prompt"] == prompt
+    assert metadata["negative_prompt"] == negative_prompt
+    assert metadata["model_id"] == image_generator.MODEL_ID
+    assert metadata["dimensions"] == {"width": 768, "height": 432}
+    assert metadata["num_inference_steps"] == 35
+    assert metadata["guidance_scale"] == 6.5
+    assert metadata["generated_at_utc"].endswith("+00:00")
 
 
 def test_scene_image_generation_rejects_prompt_that_pipeline_would_truncate(

@@ -107,14 +107,26 @@ def repair_storyboard_continuity(data: dict) -> None:
 
     for index, scene in enumerate(scenes):
         continuity = scene.setdefault("continuity", {})
+        if "previous_scene_id" in scene:
+            if (
+                "previous_scene_id" in continuity
+                and continuity["previous_scene_id"]
+                != scene["previous_scene_id"]
+            ):
+                raise ValueError(
+                    f"{scene.get('id', 'Scene')} has conflicting top-level "
+                    "and nested previous_scene_id values."
+                )
         visual_description = scene.get("visual_description", "")
         action = scene.get("action", "")
 
         if index == 0:
+            scene["previous_scene_id"] = None
             continuity["previous_scene_id"] = None
         else:
             previous_scene = scenes[index - 1]
             previous_scene_id = previous_scene["id"]
+            scene["previous_scene_id"] = previous_scene_id
             continuity["previous_scene_id"] = previous_scene_id
 
             required_start = continuity.get("required_start_state") or ""
@@ -256,7 +268,7 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
 
         if index == 0:
 
-            if scene.continuity.previous_scene_id is not None:
+            if scene.previous_scene_id is not None:
                 raise ValueError(
                     "First scene must have previous_scene_id=None."
                 )
@@ -265,7 +277,7 @@ def validate_storyboard_continuity(storyboard: Storyboard) -> None:
 
             previous_scene = scenes[index - 1]
 
-            if scene.continuity.previous_scene_id != previous_scene.id:
+            if scene.previous_scene_id != previous_scene.id:
                 raise ValueError(
                     f"{scene.id} must reference the previous "
                     f"scene {previous_scene.id}."

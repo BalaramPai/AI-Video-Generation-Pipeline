@@ -7,6 +7,8 @@ from app.storyboard.models import Scene, Storyboard
 from app.video.pipeline import (
     ImageReviewDeclined,
     generate_video_from_storyboard,
+    preflight_storyboard,
+    PreflightValidationError,
 )
 
 
@@ -79,9 +81,54 @@ def main() -> None:
             "first-frame image. Existing Runway tasks resume without review."
         ),
     )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Validate storyboard references and compile all image/video "
+            "prompts without generating images or videos."
+        ),
+    )
     args = parser.parse_args()
 
-    storyboard = _load_input_storyboard(args.storyboard)
+    try:
+        storyboard = _load_input_storyboard(args.storyboard)
+    except (OSError, ValueError) as exc:
+        if args.preflight:
+            print(f"Preflight failed: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        raise
+    if args.preflight:
+        try:
+            report = preflight_storyboard(storyboard)
+        except PreflightValidationError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(1) from exc
+        scene_label = (
+            "scene" if len(report.motion_prompts) == 1 else "scenes"
+        )
+        print(
+            "Preflight passed: "
+            f"{len(report.motion_prompts)} {scene_label}; initial image prompt "
+            f"{report.initial_image_prompt_tokens}/75 tokens."
+        )
+        for scene, diagnostics in zip(
+            storyboard.scenes,
+            report.motion_prompt_diagnostics,
+        ):
+            count = diagnostics["video_prompt_character_count"]
+            limit = diagnostics["video_prompt_character_limit"]
+            unit = diagnostics["video_prompt_character_count_unit"]
+            if limit is None:
+                print(
+                    f"  {scene.id}: motion prompt {count} ({unit}; "
+                    "provider limit not declared)."
+                )
+            else:
+                print(
+                    f"  {scene.id}: motion prompt {count}/{limit} {unit}."
+                )
+        return
     try:
         output_path = generate_video_from_storyboard(
             storyboard,
@@ -90,6 +137,9 @@ def main() -> None:
                 _review_scene_image if args.review_images else None
             ),
         )
+    except PreflightValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc
     except ImageReviewDeclined as exc:
         print(f"\n{exc}", file=sys.stderr)
         return

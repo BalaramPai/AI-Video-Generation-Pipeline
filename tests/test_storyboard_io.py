@@ -76,6 +76,101 @@ def test_parse_storyboard_json_validates_scene_duration_sum():
         parse_storyboard_json(json.dumps(data))
 
 
+def _four_scene_storyboard_data():
+    data = _storyboard_data()
+    first_scene = data["scenes"][0]
+    first_scene["id"] = "scene_001"
+    first_scene["previous_scene_id"] = None
+    first_scene["duration_seconds"] = 5
+    first_scene["continuity"].pop("previous_scene_id")
+    scenes = [first_scene]
+    for index in range(2, 5):
+        scene = json.loads(json.dumps(first_scene))
+        scene["id"] = f"scene_{index:03d}"
+        scene["previous_scene_id"] = f"scene_{index - 1:03d}"
+        scene["continuity"]["required_start_state"] = (
+            f"State at the start of scene {index}."
+        )
+        scene["continuity"]["ending_state"] = (
+            f"State at the end of scene {index}."
+        )
+        scenes.append(scene)
+    data["scenes"] = scenes
+    data["project"]["duration_seconds"] = 20
+    return data
+
+
+def test_parse_four_scene_top_level_links_and_normalizes_nested_value():
+    data = _four_scene_storyboard_data()
+
+    storyboard = parse_storyboard_json(json.dumps(data))
+
+    assert [scene.previous_scene_id for scene in storyboard.scenes] == [
+        None,
+        "scene_001",
+        "scene_002",
+        "scene_003",
+    ]
+    assert [
+        scene.continuity.previous_scene_id
+        for scene in storyboard.scenes
+    ] == [
+        None,
+        "scene_001",
+        "scene_002",
+        "scene_003",
+    ]
+
+
+def test_parse_storyboard_preserves_legacy_nested_scene_links():
+    data = _four_scene_storyboard_data()
+    for scene in data["scenes"]:
+        scene["continuity"]["previous_scene_id"] = scene.pop(
+            "previous_scene_id"
+        )
+
+    storyboard = parse_storyboard_json(json.dumps(data))
+
+    assert [scene.previous_scene_id for scene in storyboard.scenes] == [
+        None,
+        "scene_001",
+        "scene_002",
+        "scene_003",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("link_change", "error"),
+    [
+        ({"previous_scene_id": "wrong"}, "must reference the previous"),
+        ({"previous_scene_id": None}, "must reference the previous"),
+        ({"remove_both_links": True}, "must define previous_scene_id"),
+    ],
+)
+def test_parse_storyboard_rejects_malformed_or_missing_scene_links(
+    link_change,
+    error,
+):
+    data = _four_scene_storyboard_data()
+    scene = data["scenes"][1]
+    if link_change.get("remove_both_links"):
+        scene.pop("previous_scene_id")
+        scene["continuity"].pop("previous_scene_id", None)
+    else:
+        scene.update(link_change)
+
+    with pytest.raises(ValueError, match=error):
+        parse_storyboard_json(json.dumps(data))
+
+
+def test_parse_storyboard_rejects_conflicting_link_representations():
+    data = _four_scene_storyboard_data()
+    data["scenes"][1]["continuity"]["previous_scene_id"] = "scene_003"
+
+    with pytest.raises(ValueError, match="conflicts with"):
+        parse_storyboard_json(json.dumps(data))
+
+
 def test_load_storyboard_file_supports_utf8_bom(tmp_path):
     path = tmp_path / "storyboard.json"
     path.write_text(

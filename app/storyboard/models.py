@@ -77,9 +77,9 @@
 #     props: List[Prop]
 #     scenes: List[Scene]
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Project(BaseModel):
@@ -141,6 +141,7 @@ class Continuity(BaseModel):
 
 class Scene(BaseModel):
     id: str
+    previous_scene_id: Optional[str]
     duration_seconds: int = Field(gt=0)
 
     location_id: str
@@ -157,6 +158,56 @@ class Scene(BaseModel):
     shot_intent: str = ""
     visual_continuity: str = ""
     negative_prompt: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_previous_scene_id(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+
+        normalized = dict(values)
+        continuity = normalized.get("continuity")
+        if isinstance(continuity, Continuity):
+            nested_present = (
+                "previous_scene_id" in continuity.model_fields_set
+            )
+            nested_link = continuity.previous_scene_id
+            continuity_values = continuity.model_dump()
+        elif isinstance(continuity, dict):
+            nested_present = "previous_scene_id" in continuity
+            nested_link = continuity.get("previous_scene_id")
+            continuity_values = dict(continuity)
+        else:
+            nested_present = False
+            nested_link = None
+            continuity_values = continuity
+
+        top_level_present = "previous_scene_id" in normalized
+        if not top_level_present and not nested_present:
+            raise ValueError(
+                "Scene must define previous_scene_id at the scene level "
+                "or in continuity."
+            )
+        if (
+            top_level_present
+            and nested_present
+            and normalized["previous_scene_id"] != nested_link
+        ):
+            raise ValueError(
+                "Top-level previous_scene_id conflicts with "
+                "continuity.previous_scene_id."
+            )
+
+        canonical_link = (
+            normalized["previous_scene_id"]
+            if top_level_present
+            else nested_link
+        )
+        normalized["previous_scene_id"] = canonical_link
+        if isinstance(continuity_values, dict):
+            continuity_values["previous_scene_id"] = canonical_link
+            normalized["continuity"] = continuity_values
+        return normalized
 
 
 class Storyboard(BaseModel):

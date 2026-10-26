@@ -1,5 +1,7 @@
+import json
 import logging
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -7,6 +9,7 @@ import torch
 from diffusers import StableDiffusionPipeline
 
 from app.config import IMAGE_TO_IMAGE_STRENGTH
+from app.prompt_validation import PromptLimitError
 from app.storyboard.models import (
     Prop,
     Storyboard,
@@ -27,6 +30,8 @@ CHARACTER_IMAGE_NEGATIVE_PROMPT = (
 )
 # Keep two CLIP positions free for BOS/EOS, leaving 75 input IDs total.
 IMAGE_PROMPT_MAX_TOKENS = 75
+IMAGE_NUM_INFERENCE_STEPS = 35
+IMAGE_GUIDANCE_SCALE = 6.5
 
 _IMAGE_DIMENSIONS = {
     "16:9": (768, 432),
@@ -208,6 +213,27 @@ def build_scene_negative_prompt(
                 },
             )
     return prompt
+
+
+def build_initial_scene_negative_prompt(
+    storyboard: Storyboard,
+    scene: Scene,
+) -> str:
+    prop_names = {
+        prop.name.strip().casefold()
+        for prop in storyboard.props
+        if prop.id in scene.prop_ids
+    }
+    if {"sun", "moon", "earth"}.issubset(prop_names):
+        return ", ".join(
+            (
+                IMAGE_NEGATIVE_PROMPT,
+                "text",
+                "duplicate objects",
+                "repeated objects",
+            )
+        )
+    return build_scene_negative_prompt(scene)
 
 
 
@@ -409,6 +435,270 @@ def build_scene_image_prompt(
     )
 
 
+def _fit_initial_scene_image_prompt(
+    required_components: Sequence[tuple[str, str]],
+    optional_components: Sequence[tuple[str, str]],
+    *,
+    scene_id: str,
+) -> str:
+    def join_section(existing: str, component: str) -> str:
+        previous = existing.rstrip().rstrip(".,;")
+        return f"{previous}; {component}" if previous else component
+
+    prompt = ""
+    normalized_required = [
+        (field, " ".join(component.split()))
+        for field, component in required_components
+        if component and component.strip()
+    ]
+    for field, component in normalized_required:
+        candidate = join_section(prompt, component)
+        prompt = candidate
+    prompt_token_count = _token_count(prompt)
+    if prompt_token_count > IMAGE_PROMPT_MAX_TOKENS:
+        crossing_fields: list[str] = []
+        candidate = ""
+        for field, component in normalized_required:
+            candidate = join_section(candidate, component)
+            if _token_count(candidate) > IMAGE_PROMPT_MAX_TOKENS:
+                crossing_fields.append(field)
+                break
+        raise PromptLimitError(
+            "Initial scene composition details exceed the Stable Diffusion "
+            "prompt limit; shorten the storyboard fields. Essential "
+            "composition details were not omitted or truncated.",
+            scene_id=scene_id,
+            prompt_type="initial image prompt",
+            actual_length=prompt_token_count,
+            limit=IMAGE_PROMPT_MAX_TOKENS,
+            length_unit="tokens",
+            required_fields=tuple(crossing_fields),
+        )
+
+    omitted: list[str] = []
+    for name, component in optional_components:
+        compact_component = " ".join(component.split())
+        if not compact_component:
+            continue
+        candidate = join_section(prompt, compact_component)
+        if _token_count(candidate) <= IMAGE_PROMPT_MAX_TOKENS:
+            prompt = candidate
+        else:
+            omitted.append(name)
+
+    if omitted:
+        logger.info(
+            "Optional initial-scene image prompt context omitted to preserve "
+            "composition within the Stable Diffusion limit",
+            extra={
+                "prompt_label": "Initial scene image prompt",
+                "omitted_context": omitted,
+                "token_limit": IMAGE_PROMPT_MAX_TOKENS,
+                "final_token_count": _token_count(prompt),
+            },
+        )
+    return prompt
+
+
+def build_initial_scene_image_prompt(
+    storyboard: Storyboard,
+    scene: Scene,
+) -> str:
+    location = next(
+        location
+        for location in storyboard.locations
+        if location.id == scene.location_id
+    )
+    characters = [
+        character
+        for character in storyboard.characters
+        if character.id in scene.character_ids
+    ]
+    props = [
+        prop
+        for prop in storyboard.props
+        if prop.id in scene.prop_ids
+    ]
+    layout_components = _prompt_sentence_components(
+        "Layout",
+        scene.blocking,
+        prioritize_layout=True,
+    )
+    layout_components = [
+        component
+        for component in layout_components
+        if not re.search(
+            r"\b(then|later|finally|raises|lowers|moves|moving|aligns)\b",
+            component,
+            re.IGNORECASE,
+        )
+    ]
+    if not layout_components:
+        layout_components = _prompt_sentence_components(
+            "Layout",
+            location.continuity_anchor or location.description,
+            prioritize_layout=True,
+        )
+    opening_state_components = _prompt_sentence_components(
+        "Opening state",
+        scene.continuity.required_start_state,
+    )
+    character_names = "; ".join(
+        character.name for character in characters
+    )
+    prop_names = "; ".join(prop.name for prop in props)
+    props_by_name = {
+        prop.name.strip().casefold(): prop for prop in props
+    }
+    solar_system_scene = all(
+        role in props_by_name for role in ("sun", "moon", "earth")
+    )
+    storyboard_context = " ".join(
+        (
+            location.description,
+            location.continuity_anchor,
+            scene.blocking,
+            scene.continuity.required_start_state,
+            scene.visual_description,
+        )
+    )
+    frame_target = (
+        "full table"
+        if re.search(r"\btable\b", storyboard_context, re.IGNORECASE)
+        else "complete scene setup"
+    )
+
+    if solar_system_scene:
+        required = [
+            (
+                "camera framing",
+                f"{scene.camera.shot_type} view",
+            ),
+            ("dark-space setting", "Dark space"),
+            (
+                "Sun identity and placement",
+                f"One luminous star {props_by_name['sun'].name} on the left",
+            ),
+            (
+                "Moon identity and placement",
+                f"One small gray cratered {props_by_name['moon'].name} near "
+                "center, slightly above the Sun-Earth line",
+            ),
+            (
+                "Earth identity and placement",
+                f"One recognizable blue {props_by_name['earth'].name} on "
+                "the right",
+            ),
+            (
+                "distinct visible bodies",
+                "All three distinct and fully visible",
+            ),
+        ]
+    else:
+        required = [
+            (
+                "camera framing",
+                f"{scene.camera.shot_type} establishing; {frame_target}.",
+            ),
+        ]
+        if character_names:
+            required.append(
+                (
+                    "character identity and visibility",
+                    f"{character_names}; face and both hands visible.",
+                )
+            )
+        if prop_names:
+            required.append(
+                ("assigned prop identities", f"Props: {prop_names}.")
+            )
+        if layout_components:
+            required.append(
+                (
+                    "storyboard blocking and layout",
+                    layout_components[0].partition(":")[2].strip(),
+                )
+            )
+        if opening_state_components:
+            required.append(
+                (
+                    "required opening state",
+                    opening_state_components[0].partition(":")[2].strip(),
+                )
+            )
+        required.append(
+            (
+                "scale, background, and duplicate constraints",
+                "Natural scale; clean background; no duplicates.",
+            )
+        )
+
+    visual_context = [
+        sentence.strip()
+        for sentence in re.split(
+            r"(?<=[.!?])\s+",
+            " ".join(scene.visual_description.split()),
+        )
+        if sentence.strip()
+        and not re.search(
+            r"\b(then|later|finally|raises|lowers|moves|moving)\b",
+            sentence,
+            re.IGNORECASE,
+        )
+    ]
+    visual_context.sort(
+        key=lambda sentence: (
+            -sum(
+                term in sentence.casefold()
+                for term in (
+                    "visible",
+                    "in frame",
+                    "left",
+                    "right",
+                    "behind",
+                    "between",
+                    "center",
+                    "table",
+                )
+            ),
+            scene.visual_description.find(sentence),
+        )
+    )
+    optional = [
+        ("camera angle", scene.camera.angle),
+        ("camera movement", scene.camera.movement),
+        ("visual description", " ".join(visual_context)),
+        (
+            "character appearance",
+            "; ".join(
+                _character_prompt(character)
+                for character in characters
+            ),
+        ),
+        (
+            "prop descriptions",
+            "; ".join(_compact_prop_prompt(prop) for prop in props),
+        ),
+        (
+            "location",
+            ", ".join(
+                detail for detail in (location.name, location.description)
+                if detail
+            ),
+        ),
+        ("location visual style", location.visual_style),
+        ("lighting", location.lighting),
+        ("visual style", storyboard.project.visual_style),
+    ]
+    if solar_system_scene:
+        optional = [("camera angle", scene.camera.angle)]
+    return _fit_initial_scene_image_prompt(
+        required,
+        optional,
+        scene_id=scene.id,
+    )
+
+
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
 TOKENIZER = CLIPTokenizer.from_pretrained(
     MODEL_ID,
@@ -437,6 +727,7 @@ def generate_scene_image(
     output_path: str,
     negative_prompt: str | None = None,
     aspect_ratio: str = "16:9",
+    metadata_path: str | Path | None = None,
 ) -> str:
 
     output = Path(output_path)
@@ -463,11 +754,30 @@ def generate_scene_image(
         negative_prompt=effective_negative_prompt,
         width=width,
         height=height,
-        num_inference_steps=35,
-        guidance_scale=6.5,
+        num_inference_steps=IMAGE_NUM_INFERENCE_STEPS,
+        guidance_scale=IMAGE_GUIDANCE_SCALE,
     ).images[0]
 
     image.save(output)
+    if metadata_path is not None:
+        metadata_output = Path(metadata_path)
+        metadata_output.parent.mkdir(parents=True, exist_ok=True)
+        metadata_output.write_text(
+            json.dumps(
+                {
+                    "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "prompt": prompt,
+                    "negative_prompt": effective_negative_prompt,
+                    "model_id": MODEL_ID,
+                    "dimensions": {"width": width, "height": height},
+                    "num_inference_steps": IMAGE_NUM_INFERENCE_STEPS,
+                    "guidance_scale": IMAGE_GUIDANCE_SCALE,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
     print(f"Image saved to: {output}")
 

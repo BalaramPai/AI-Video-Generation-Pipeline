@@ -79,6 +79,20 @@ submitting that scene's video request. When resuming an existing Runway task,
 the review pause is skipped because Runway restores the input image saved with
 the submitted task.
 
+Use `--preflight` to validate storyboard references, scene durations, and
+continuity, then compile the actual initial-image and motion prompts without
+generating images or videos:
+
+```powershell
+python -m app.main path\to\storyboard.json --preflight
+```
+
+Preflight reports all prompt-limit failures together, including scene IDs,
+measured lengths, limits, and required fields contributing to overflow. Normal
+generation runs the same preflight before creating scene assets and then uses
+the compiled prompts, so an invalid later-scene prompt cannot trigger earlier
+paid generation requests.
+
 Runway task IDs and the submitted first-frame image are saved beside each
 scene video while generation is pending. If polling times out or you interrupt
 the CLI, rerunning with the same storyboard and output directory resumes that
@@ -119,19 +133,21 @@ the image and motion prompts.
 
 Image prompts are compacted against a conservative Stable Diffusion 1.5 CLIP
 limit (75 tokenizer IDs including special tokens) instead of allowing silent
-model-side truncation. The builder prioritizes character identity and
-wardrobe, visible prop names, spatial layout, and starting state. It keeps
-complete prompt sections or omits them; it never cuts an instruction mid-text.
-Omitted required sections are logged, and optional detail such as style,
-location, and camera information is added only when it fits. Short storyboard
-descriptions still produce the best prompts. Continuation prompts prioritize
-the scene's required starting state, visible props, and composition. Generated
-motion prompts repeat the start state, action, and end state, name the
-storyboard props, and prioritize safeguards against identity morphing, extra
-limbs, duplicate people or props, costume changes, prop teleportation, flicker,
-and sudden cuts. Image prompts retain action text only if it fits after the
-starting state, prop identities, and composition. Constraints that do not fit
-the provider limit are reported.
+model-side truncation. Scene 1 has a dedicated initial-composition prompt
+builder that prioritizes its camera framing, character visibility, named
+props, storyboard blocking, and required opening state. It keeps those
+composition instructions complete and within the 75-token budget; optional
+camera, visual, location, lighting, and style details are added only when
+they fit, with omitted context logged. Its prompt describes the opening still,
+not the scene's later action. Other scene and continuity prompt builders keep
+their existing behavior. Short storyboard descriptions still produce the
+best prompts. Continuation prompts prioritize the scene's required starting
+state, visible props, and composition. Generated motion prompts repeat the
+start state, action, and end state, name the storyboard props, and prioritize
+safeguards against identity morphing, extra limbs, duplicate people or props,
+costume changes, prop teleportation, flicker, and sudden cuts. Image prompts
+retain action text only if it fits after the starting state, prop identities,
+and composition. Constraints that do not fit the provider limit are reported.
 
 Runway motion prompts use the model-specific limits from the Runway API
 schema: 1,000 UTF-16 code units for Gen-4.5 and 2,500 for Grok Imagine 1.5.

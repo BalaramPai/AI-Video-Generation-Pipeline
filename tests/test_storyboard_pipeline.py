@@ -20,11 +20,19 @@ def test_generate_video_from_storyboard_runs_without_storyboard_generation(
     storyboard = parse_storyboard_json(
         json.dumps(_storyboard_data())
     )
+    storyboard.scenes[0].id = "OPENING_SCENE"
     calls = {}
+    initial_prompt_builder = pipeline.build_initial_scene_image_prompt
+
+    def capture_initial_prompt(storyboard, scene):
+        calls["initial_prompt_scene_id"] = scene.id
+        return initial_prompt_builder(storyboard, scene)
 
     def fake_generate_image(**kwargs):
         Path(kwargs["output_path"]).write_bytes(b"image")
         calls["image_prompt"] = kwargs["prompt"]
+        calls["image_negative_prompt"] = kwargs["negative_prompt"]
+        calls["image_generation_metadata_path"] = kwargs["metadata_path"]
 
     def fake_generate_video(**kwargs):
         Path(kwargs["output_path"]).write_bytes(b"video")
@@ -46,6 +54,11 @@ def test_generate_video_from_storyboard_runs_without_storyboard_generation(
         calls["join_frame_rate"] = kwargs["frame_rate"]
 
     monkeypatch.setattr(pipeline, "generate_scene_image", fake_generate_image)
+    monkeypatch.setattr(
+        pipeline,
+        "build_initial_scene_image_prompt",
+        capture_initial_prompt,
+    )
     monkeypatch.setattr(pipeline, "generate_scene_video", fake_generate_video)
     monkeypatch.setattr(
         pipeline,
@@ -78,11 +91,32 @@ def test_generate_video_from_storyboard_runs_without_storyboard_generation(
     assert final_path == tmp_path / "final_video.mp4"
     assert final_path.read_bytes() == b"final video"
     assert "engine" in calls["image_prompt"].lower()
+    assert calls["image_negative_prompt"] == (
+        pipeline.build_initial_scene_negative_prompt(
+            storyboard,
+            storyboard.scenes[0],
+        )
+    )
+    assert calls["image_generation_metadata_path"] == (
+        tmp_path / "scene_001_image_generation.json"
+    )
     assert "Subject lock" in calls["video_prompt"]
     assert calls["duration"] == 5
     assert calls["target_frame_rate"] is None
     assert calls["target_frame_count"] is None
     assert calls["normalize_output"] is False
+    assert (
+        tmp_path.joinpath("scene_001_video_prompt.txt").read_text(
+            encoding="utf-8"
+        )
+        == calls["video_prompt"]
+    )
+    assert (
+        tmp_path.joinpath("scene_001_image_prompt.txt").read_text(
+            encoding="utf-8"
+        )
+        == calls["image_prompt"]
+    )
     assert calls["normalization_source"] == str(tmp_path / "scene_001.mp4")
     assert calls["normalized_frame_count"] == 120
     assert calls["join_durations"] == [5]
@@ -92,7 +126,8 @@ def test_generate_video_from_storyboard_runs_without_storyboard_generation(
     diagnostics = json.loads(
         (tmp_path / "scene_001_generation.json").read_text(encoding="utf-8")
     )
-    assert diagnostics["scene_id"] == "SCENE_001"
+    assert diagnostics["scene_id"] == "OPENING_SCENE"
+    assert calls["initial_prompt_scene_id"] == "OPENING_SCENE"
     assert diagnostics["provider"] == pipeline.VIDEO_PROVIDER
     assert diagnostics["model"]
     assert diagnostics["image_prompt"]
@@ -204,6 +239,7 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
     storyboard.project.duration_seconds = 15
     scene_three = storyboard.scenes[1].model_copy(deep=True)
     scene_three.id = "SCENE_003"
+    scene_three.previous_scene_id = "SCENE_002"
     scene_three.continuity.previous_scene_id = "SCENE_002"
     scene_three.continuity.required_start_state = (
         "The switch remains closed and the bulb remains lit."

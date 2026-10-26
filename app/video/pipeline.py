@@ -3,14 +3,18 @@ import json
 import logging
 import re
 import shutil
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
 from app.assets.image_generator import (
+    IMAGE_PROMPT_MAX_TOKENS,
+    _token_count,
     build_scene_negative_prompt,
+    build_initial_scene_negative_prompt,
     build_continuity_image_prompt,
-    build_scene_image_prompt,
+    build_initial_scene_image_prompt,
     generate_scene_image,
     generate_scene_image_from_reference,
 )
@@ -21,6 +25,7 @@ from app.config import (
     VEO_MODEL,
     VIDEO_PROVIDER,
 )
+from app.prompt_validation import PromptLimitError
 from app.storyboard.generator import validate_storyboard_continuity
 from app.storyboard.models import Scene, Storyboard
 from app.video.composer import (
@@ -75,15 +80,32 @@ def _fit_required_motion_prompt(
     components: list[str],
     maximum_characters: int,
     character_length: Callable[[str], int],
+    *,
+    scene_id: str,
+    field_names: tuple[str, ...],
 ) -> str:
     normalized = [" ".join(component.split()) for component in components]
     prompt = " ".join(component for component in normalized if component)
-    if character_length(prompt) > maximum_characters:
-        raise ValueError(
+    prompt_length = character_length(prompt)
+    if prompt_length > maximum_characters:
+        candidate = ""
+        overflow_fields: list[str] = []
+        for field, component in zip(field_names, normalized):
+            candidate = f"{candidate} {component}".strip()
+            if character_length(candidate) > maximum_characters:
+                overflow_fields.append(field)
+                break
+        raise PromptLimitError(
             "Required Runway motion details exceed the provider limit; "
             "shorten the subject, starting state, action, ending state, or "
             f"camera instructions to fit within {maximum_characters} "
-            "UTF-16 characters. Required details were not truncated."
+            "UTF-16 characters. Required details were not truncated.",
+            scene_id=scene_id,
+            prompt_type="Runway motion prompt",
+            actual_length=prompt_length,
+            limit=maximum_characters,
+            length_unit="UTF-16 code units",
+            required_fields=tuple(overflow_fields),
         )
     return prompt
 
@@ -257,14 +279,19 @@ def _build_motion_prompt(
         RUNWAY_PROMPT_MAX_CHARACTERS,
     )
 
-    try:
-        required_prompt = _fit_required_motion_prompt(
-            core_components,
-            maximum_prompt_characters,
-            _utf16_length,
-        )
-    except ValueError as exc:
-        raise ValueError(f"{scene.id}: {exc}") from exc
+    required_prompt = _fit_required_motion_prompt(
+        core_components,
+        maximum_prompt_characters,
+        _utf16_length,
+        scene_id=scene.id,
+        field_names=(
+            "subject identity",
+            "required starting state",
+            "action",
+            "ending state",
+            "camera constraints",
+        ),
+    )
 
     def negative_priority(clause: str) -> int:
         normalized = clause.casefold()
@@ -430,13 +457,141 @@ def _build_motion_prompt(
     return prompt
 
 
+@dataclass(frozen=True)
+class StoryboardPreflight:
+    initial_image_prompt: str
+    initial_image_prompt_tokens: int
+    motion_prompts: tuple[str, ...]
+    motion_prompt_diagnostics: tuple[dict, ...]
+
+
+class PreflightValidationError(ValueError):
+    def __init__(
+        self,
+        *,
+        storyboard_errors: tuple[str, ...] = (),
+        prompt_errors: tuple[PromptLimitError, ...] = (),
+        other_errors: tuple[str, ...] = (),
+    ) -> None:
+        self.storyboard_errors = storyboard_errors
+        self.prompt_errors = prompt_errors
+        self.other_errors = other_errors
+        lines = ["Preflight validation failed:"]
+        lines.extend(f"- Storyboard: {error}" for error in storyboard_errors)
+        lines.extend(f"- {error}" for error in prompt_errors)
+        lines.extend(f"- {error}" for error in other_errors)
+        super().__init__("\n".join(lines))
+
+
+def preflight_storyboard(storyboard: Storyboard) -> StoryboardPreflight:
+    """Validate storyboard references and compile every production prompt."""
+    try:
+        validate_storyboard_continuity(storyboard)
+    except ValueError as exc:
+        raise PreflightValidationError(
+            storyboard_errors=(str(exc),),
+        ) from exc
+
+    prompt_errors: list[PromptLimitError] = []
+    other_errors: list[str] = []
+    initial_image_prompt: str | None = None
+    initial_image_prompt_tokens: int | None = None
+    try:
+        initial_image_prompt = build_initial_scene_image_prompt(
+            storyboard,
+            storyboard.scenes[0],
+        )
+        initial_image_prompt_tokens = _token_count(initial_image_prompt)
+        if initial_image_prompt_tokens > IMAGE_PROMPT_MAX_TOKENS:
+            prompt_errors.append(
+                PromptLimitError(
+                    "Initial scene image prompt exceeds the Stable "
+                    "Diffusion limit.",
+                    scene_id=storyboard.scenes[0].id,
+                    prompt_type="initial image prompt",
+                    actual_length=initial_image_prompt_tokens,
+                    limit=IMAGE_PROMPT_MAX_TOKENS,
+                    length_unit="tokens",
+                    required_fields=("assembled initial-image prompt",),
+                )
+            )
+    except PromptLimitError as exc:
+        prompt_errors.append(exc)
+    except ValueError as exc:
+        other_errors.append(
+            f"{storyboard.scenes[0].id} initial image prompt: {exc}"
+        )
+
+    motion_prompts: list[str] = []
+    motion_prompt_diagnostics: list[dict] = []
+    for scene in storyboard.scenes:
+        diagnostics: dict = {}
+        try:
+            motion_prompt = _build_motion_prompt(
+                storyboard,
+                scene,
+                compilation_diagnostics=diagnostics,
+            )
+        except PromptLimitError as exc:
+            prompt_errors.append(exc)
+            motion_prompts.append("")
+            motion_prompt_diagnostics.append(diagnostics)
+            continue
+        except ValueError as exc:
+            other_errors.append(f"{scene.id} motion prompt: {exc}")
+            motion_prompts.append("")
+            motion_prompt_diagnostics.append(diagnostics)
+            continue
+
+        prompt_length = diagnostics["video_prompt_character_count"]
+        prompt_limit = diagnostics["video_prompt_character_limit"]
+        if prompt_limit is not None and prompt_length > prompt_limit:
+            prompt_errors.append(
+                PromptLimitError(
+                    "Assembled Runway motion prompt exceeds the provider "
+                    "limit.",
+                    scene_id=scene.id,
+                    prompt_type="Runway motion prompt",
+                    actual_length=prompt_length,
+                    limit=prompt_limit,
+                    length_unit="UTF-16 code units",
+                    required_fields=(
+                        "subject identity",
+                        "required starting state",
+                        "action",
+                        "ending state",
+                        "camera constraints",
+                    ),
+                )
+            )
+        motion_prompts.append(motion_prompt)
+        motion_prompt_diagnostics.append(diagnostics)
+
+    if prompt_errors or other_errors:
+        raise PreflightValidationError(
+            prompt_errors=tuple(prompt_errors),
+            other_errors=tuple(other_errors),
+        )
+    if initial_image_prompt is None or initial_image_prompt_tokens is None:
+        raise RuntimeError(
+            "Preflight did not produce the required initial image prompt."
+        )
+
+    return StoryboardPreflight(
+        initial_image_prompt=initial_image_prompt,
+        initial_image_prompt_tokens=initial_image_prompt_tokens,
+        motion_prompts=tuple(motion_prompts),
+        motion_prompt_diagnostics=tuple(motion_prompt_diagnostics),
+    )
+
+
 def generate_video_from_storyboard(
     storyboard: Storyboard,
     output_dir: str | Path = Path("outputs"),
     image_review_callback: ImageReviewCallback | None = None,
 ) -> Path:
     """Generate a video from a validated storyboard without creating one."""
-    validate_storyboard_continuity(storyboard)
+    preflight = preflight_storyboard(storyboard)
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
     (output_directory / "storyboard.json").write_text(
@@ -466,7 +621,18 @@ def generate_video_from_storyboard(
         motion_prompt_path = output_directory / (
             f"scene_{scene_number:03d}_video_prompt.txt"
         )
-        negative_prompt = build_scene_negative_prompt(scene)
+        negative_prompt = (
+            build_initial_scene_negative_prompt(storyboard, scene)
+            if index == 0
+            else build_scene_negative_prompt(scene)
+        )
+        image_generation_metadata_path = (
+            image_path.with_name(
+                f"{image_path.stem}_image_generation.json"
+            )
+            if index == 0
+            else None
+        )
         diagnostics = {
             "scene_id": scene.id,
             "requested_duration_seconds": scene.duration_seconds,
@@ -504,6 +670,11 @@ def generate_video_from_storyboard(
             "dialogue": scene.dialogue,
             "audio_generation": "not supported by this video pipeline",
             "image_prompt_path": str(image_prompt_path),
+            "image_generation_metadata_path": (
+                str(image_generation_metadata_path)
+                if image_generation_metadata_path is not None
+                else None
+            ),
             "scene_image_path": str(image_path),
             "reference_frame_paths": [],
             "continuity_image_generation_mode": (
@@ -561,7 +732,7 @@ def generate_video_from_storyboard(
                 )
 
         if index == 0:
-            image_prompt = build_scene_image_prompt(storyboard, scene)
+            image_prompt = preflight.initial_image_prompt
             diagnostics["image_prompt"] = image_prompt
             image_prompt_path.write_text(image_prompt, encoding="utf-8")
             _write_scene_diagnostics(diagnostics_path, diagnostics)
@@ -578,6 +749,11 @@ def generate_video_from_storyboard(
                 },
             )
             try:
+                if (
+                    image_generation_metadata_path is not None
+                    and image_generation_metadata_path.exists()
+                ):
+                    image_generation_metadata_path.unlink()
                 if image_path.exists():
                     image_path.unlink()
                 generate_scene_image(
@@ -585,6 +761,7 @@ def generate_video_from_storyboard(
                     output_path=str(image_path),
                     negative_prompt=negative_prompt,
                     aspect_ratio=storyboard.project.aspect_ratio,
+                    metadata_path=image_generation_metadata_path,
                 )
             except Exception as exc:
                 diagnostics["error"] = (
@@ -786,23 +963,8 @@ def generate_video_from_storyboard(
         runway_task_state_path = video_path.with_name(
                 f"{video_path.stem}.runway-task.json"
         )
-        try:
-            motion_prompt = _build_motion_prompt(
-                storyboard,
-                scene,
-                compilation_diagnostics=diagnostics,
-            )
-        except Exception as exc:
-            diagnostics["error"] = (
-                f"Motion prompt compilation failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            _write_scene_diagnostics(diagnostics_path, diagnostics)
-            logger.exception(
-                "Scene motion prompt compilation failed",
-                extra={"scene_id": scene.id},
-            )
-            raise
+        motion_prompt = preflight.motion_prompts[index]
+        diagnostics.update(preflight.motion_prompt_diagnostics[index])
         diagnostics["video_prompt"] = motion_prompt
         motion_prompt_path.write_text(motion_prompt, encoding="utf-8")
         diagnostics["first_frame_image_path"] = str(image_path)
