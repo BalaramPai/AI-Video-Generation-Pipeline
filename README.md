@@ -22,12 +22,15 @@ continuity between scenes, and joins the generated clips into one MP4.
 
    The secret is sent only to Runway's API and must not be committed.
 
-      Img2img continuity strength defaults to `0.30`. It can be varied between
-      `0.0` and `1.0` for controlled experiments without changing code:
+   Later scenes use the previous clip's extracted ending frame directly by
+   default. To use the existing Stable Diffusion img2img continuity path
+   instead, set `CONTINUITY_IMAGE_MODE=img2img`; its denoise strength
+   defaults to `0.30` and can be varied between `0.0` and `1.0`:
 
-      ```text
-      IMAGE_TO_IMAGE_STRENGTH=0.30
-      ```
+   ```text
+   CONTINUITY_IMAGE_MODE=img2img
+   IMAGE_TO_IMAGE_STRENGTH=0.30
+   ```
 
 4. Choose the provider and model in `.env`:
 
@@ -70,6 +73,11 @@ seconds. The provider validates its own model-specific duration limits before
 making requests. Scene images, scene videos, continuity frames, a copy of the
 validated storyboard, and the final MP4 are written to `outputs/` by default.
 Use `--output-dir path\to\output` to select another output directory.
+Add `--review-images` to pause before each new video request and inspect the
+image that will be used as that scene's first frame. Declining stops without
+submitting that scene's video request. When resuming an existing Runway task,
+the review pause is skipped because Runway restores the input image saved with
+the submitted task.
 
 Runway task IDs and the submitted first-frame image are saved beside each
 scene video while generation is pending. If polling times out or you interrupt
@@ -109,28 +117,32 @@ duplicate character or prop assignments. Scenes without visible characters
 are supported; their continuity subject state and visual description drive
 the image and motion prompts.
 
-Image prompts include every character in the scene, the scene action, and the
-camera framing. They are compacted against a conservative Stable Diffusion
-1.5 CLIP limit (75 tokenizer IDs including special tokens) instead of allowing
-silent model-side truncation. If required details exceed that limit, the
-builder fairly shortens text across the subject, start state, action, layout,
-and props at word boundaries, and logs which fields were shortened. Short
-storyboard descriptions still produce the best prompts; optional style,
-location, and camera details are omitted only when necessary. Continuation
-images use the last frame as an img2img reference with a low denoise strength
-so identity and composition are preserved rather than redrawn. Generated
-motion prompts repeat the start state, blocking, prop state, and end state and
-explicitly exclude identity morphing, extra limbs, duplicate people, costume
-changes, prop teleportation, flicker, and sudden cuts.
+Image prompts are compacted against a conservative Stable Diffusion 1.5 CLIP
+limit (75 tokenizer IDs including special tokens) instead of allowing silent
+model-side truncation. The builder prioritizes character identity and
+wardrobe, visible prop names, spatial layout, and starting state. It keeps
+complete prompt sections or omits them; it never cuts an instruction mid-text.
+Omitted required sections are logged, and optional detail such as style,
+location, and camera information is added only when it fits. Short storyboard
+descriptions still produce the best prompts. Continuation prompts prioritize
+the scene's required starting state, visible props, and composition. Generated
+motion prompts repeat the start state, action, and end state, name the
+storyboard props, and prioritize safeguards against identity morphing, extra
+limbs, duplicate people or props, costume changes, prop teleportation, flicker,
+and sudden cuts. Image prompts retain action text only if it fits after the
+starting state, prop identities, and composition. Constraints that do not fit
+the provider limit are reported.
 
 Runway motion prompts use the model-specific limits from the Runway API
 schema: 1,000 UTF-16 code units for Gen-4.5 and 2,500 for Grok Imagine 1.5.
 The compiler keeps the subject, starting state, action, ending state, and
-camera instructions complete; it prioritizes complete negative clauses and
-optional visual/context details after those fields. Omitted optional sections
-and negative constraints are reported. If the required core alone is too
-long, generation fails with a request to shorten the storyboard rather than
-truncating an essential instruction.
+camera shot/angle/movement instructions complete, and uses concise identity
+and camera wording when targeting Runway. It adds the highest-priority
+blocking sentence (such as keeping visible props in frame) and camera lens
+before fitting negative clauses and optional visual/context details. Omitted
+sections and negative constraints are reported. If the required core alone is
+too long, generation fails with a request to shorten the storyboard rather
+than truncating an essential instruction.
 
 Negative prompts are also kept within the model limit. Built-in quality and
 character safeguards take priority; comma- or semicolon-separated storyboard
@@ -147,17 +159,19 @@ not synthesize narration or render deterministic text labels/overlays.
 
 These controls reduce, but cannot eliminate, artifacts from the underlying
 video model. Each generated scene image is supplied as the video's starting
-frame; for later scenes the Stable Diffusion img2img pipeline first uses
-verified decoded frames extracted from the normalized previous scene video.
+frame. Later scenes use verified decoded frames extracted from the normalized
+previous scene video. By default, that frame is copied directly to the next
+scene's first-frame image, avoiding a new image-generation step at the
+continuity boundary. Set `CONTINUITY_IMAGE_MODE=img2img` to pass the extracted
+frame through the existing Stable Diffusion img2img pipeline instead.
 The extractor clears old frame files, validates image decoding and dimensions,
 and falls back to the nearest earlier valid frame if the clip's final frame
 cannot be used. If no valid reference can be extracted, generation stops.
 Runway image-to-video supports a starting image but not a separate last frame
-or reference-image list; the extracted frame is passed through img2img, and
-that generated continuity image is uploaded as Runway's first-frame input.
-Runway's API request does not contain a separate reference-image field. Keep
-each scene to one primary action, one camera movement, and a small number of
-characters and interacting props.
+or reference-image list; the selected frame (or the img2img result) is
+uploaded as Runway's first-frame input. Runway's API request does not contain
+a separate reference-image field. Keep each scene to one primary action, one
+camera movement, and a small number of characters and interacting props.
 
 The current Runway Gen-4.5 and Grok Imagine 1.5 integration uses the
 image-to-video endpoint and cannot take a preceding video as temporal
@@ -169,20 +183,23 @@ continuation.
 
 Each later scene's `scene_NNN_generation.json` also records the previous and
 next scene IDs, source video timing, extracted candidate frame indexes and
-timestamps, selected reference, img2img input/output, provider input image,
-effective img2img strength, and transition status. Candidate timestamps are
-calculated from decoded frame indexes and the normalized constant frame rate.
-The final MP4 currently uses hard cuts; no crossfade is applied automatically.
-This keeps transitions from hiding incompatible poses or motion.
+timestamps, selected reference, continuity mode, reference and first-frame
+SHA-256 hashes, provider generation ID, and transition status. In
+`previous_frame` mode, matching reference and continuity-image hashes verify
+that the image was copied directly; img2img mode records the distinct result
+and the configured strength. Candidate timestamps are calculated from
+decoded frame indexes and the normalized constant frame rate. The final MP4
+currently uses hard cuts; no crossfade is applied automatically.
 
 ### Evaluating continuity changes
 
 The automated suite verifies file handoffs and timing, not perceived motion
 quality. For a visual comparison, use the same storyboard, provider, model,
-scene durations, and prompt text in separate output directories. Change only
-one setting at a time (for example, `IMAGE_TO_IMAGE_STRENGTH=0.20`, `0.30`,
-or `0.40`), and expect each Runway run to incur generation cost. The pipeline
-does not launch these paid comparisons automatically.
+scene durations, and prompt text in separate output directories. Compare
+`CONTINUITY_IMAGE_MODE=previous_frame` with `CONTINUITY_IMAGE_MODE=img2img`;
+when evaluating img2img, vary only its `IMAGE_TO_IMAGE_STRENGTH`. Each Runway
+run incurs generation cost. The pipeline does not launch these paid
+comparisons automatically.
 
 For every scene boundary, inspect the last two seconds of the preceding clip
 and the first two seconds of the next clip, then watch the complete output.

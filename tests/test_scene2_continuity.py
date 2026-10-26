@@ -18,5 +18,5 @@ def test_scene2_prompt_preserves_reference_state_and_action():
 
     assert "same battery, wire, open switch, unlit bulb" in prompt.lower()
     assert "close switch; bulb lights" in prompt.lower()
-    assert "honor this initial state" in prompt.lower()
+    assert "preserve reference composition" in prompt.lower()
     assert _token_count(prompt) <= 75

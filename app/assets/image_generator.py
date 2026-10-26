@@ -106,7 +106,7 @@ def _fit_image_prompt(
     label: str,
     optional_components: Sequence[tuple[str, str]] = (),
 ) -> str:
-    """Fit required scene details fairly, then add optional context."""
+    """Fit complete, prioritized prompt sections without clipping text."""
     required = [
         " ".join(component.split())
         for component in required_components
@@ -115,63 +115,39 @@ def _fit_image_prompt(
     if not required:
         raise ValueError(f"{label} has no required scene information.")
 
-    prompt = ", ".join(required)
-    if _token_count(prompt) > IMAGE_PROMPT_MAX_TOKENS:
-        components: list[tuple[str, list[str]]] = []
-        for component in required:
-            heading, separator, body = component.partition(":")
-            if separator:
-                components.append((f"{heading}:", body.strip().split()))
-            else:
-                components.append(("", component.split()))
+    prompt = ""
+    omitted_components = []
+    for component in required:
+        candidate = f"{prompt}, {component}" if prompt else component
+        if _token_count(candidate) <= IMAGE_PROMPT_MAX_TOKENS:
+            prompt = candidate
+        else:
+            heading, separator, _ = component.partition(":")
+            omitted_components.append(
+                heading.strip() if separator else component
+            )
 
-        selected_words = [[] for _ in components]
-        word_indexes = [0 for _ in components]
+    if not prompt:
+        raise ValueError(
+            f"{label} could not fit any complete required section within "
+            f"the {IMAGE_PROMPT_MAX_TOKENS}-token Stable Diffusion limit. "
+            "Shorten the storyboard's subject or continuity fields."
+        )
 
-        def render_required() -> str:
-            rendered = []
-            for (heading, _), words in zip(
-                components,
-                selected_words,
-                strict=True,
-            ):
-                if words:
-                    rendered.append(" ".join((heading, *words)).strip())
-                elif heading:
-                    rendered.append(heading)
-            return ", ".join(rendered)
-
-        while True:
-            added_word = False
-            for index, (_, words) in enumerate(components):
-                if word_indexes[index] >= len(words):
-                    continue
-                selected_words[index].append(words[word_indexes[index]])
-                candidate = render_required()
-                if _token_count(candidate) <= IMAGE_PROMPT_MAX_TOKENS:
-                    word_indexes[index] += 1
-                    added_word = True
-                else:
-                    selected_words[index].pop()
-            if not added_word:
-                break
-
-        prompt = render_required()
-        shortened_components = [
-            components[index][0].rstrip(":") or f"detail {index + 1}"
-            for index, words in enumerate(components)
-            if word_indexes[index] < len(words)
-        ]
+    if omitted_components:
+        omitted_components = list(dict.fromkeys(omitted_components))
         logger.warning(
             "%s required details exceeded the Stable Diffusion prompt limit; "
-            "some detail text was shortened at word boundaries. Inspect the "
-            "saved prompt and shorten these storyboard fields for best "
+            "complete sections were omitted rather than cut mid-instruction. "
+            "Omitted sections: %s. Shorten these storyboard fields for best "
             "results.",
             label,
+            ", ".join(omitted_components),
             extra={
                 "prompt_label": label,
-                "shortened_components": shortened_components,
+                "omitted_components": omitted_components,
                 "token_limit": IMAGE_PROMPT_MAX_TOKENS,
+                "final_token_count": _token_count(prompt),
             },
         )
 
@@ -238,6 +214,8 @@ def build_scene_negative_prompt(
 def _scene_image_prompt_components(
     storyboard: Storyboard,
     scene: Scene,
+    *,
+    continuity: bool = False,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     location = next(
         location
@@ -252,7 +230,8 @@ def _scene_image_prompt_components(
     ]
 
     character_details = "; ".join(
-        _character_prompt(character) for character in characters
+        f"{character.name}, {character.appearance.clothing}"
+        for character in characters
     )
     relevant_props = [
         prop
@@ -263,19 +242,54 @@ def _scene_image_prompt_components(
         _compact_prop_prompt(prop)
         for prop in relevant_props
     )
-    subject = character_details or prop_details or scene.continuity.character_state
-    required = [
-        f"Subject: {subject}",
-        f"Start: {scene.continuity.required_start_state}",
-        f"Action: {scene.action}",
-        f"Layout: {scene.visual_description}",
-    ]
-    if scene.blocking.strip():
-        required.append(f"Layout: {scene.blocking}")
-    if character_details and prop_details:
-        required.append(f"Relevant objects: {prop_details}")
+    prop_names = "; ".join(
+        prop.name for prop in relevant_props
+    )
+    subject = character_details or (
+        scene.continuity.character_state if not relevant_props else ""
+    )
+    start_components = _prompt_sentence_components(
+        "Start",
+        scene.continuity.required_start_state,
+        prioritize_layout=True,
+    )
+    required = []
+    if continuity:
+        required.append(
+            "Reference: Preserve reference composition and object positions."
+        )
+    if subject:
+        required.append(f"Subject: {subject}")
+    if start_components:
+        required.append(start_components[0])
+    if prop_names:
+        required.append(f"Visible props: {prop_names}")
+    required.extend(
+        _prompt_sentence_components(
+            "Composition",
+            scene.blocking,
+            prioritize_layout=True,
+        )
+    )
+    required.extend(start_components[1:])
+    required.extend(
+        _prompt_sentence_components(
+            "Visual",
+            scene.visual_description,
+            prioritize_layout=True,
+        )
+    )
 
     optional = [
+        ("relevant prop details", prop_details),
+        ("action", scene.action),
+        (
+            "character appearance",
+            "; ".join(
+                _character_prompt(character)
+                for character in characters
+            ),
+        ),
         ("environment state", scene.continuity.environment_state),
         (
             "location",
@@ -305,6 +319,47 @@ def _scene_image_prompt_components(
         ),
     ]
     return required, optional
+
+
+def _prompt_sentence_components(
+    label: str,
+    text: str,
+    *,
+    prioritize_layout: bool = False,
+) -> list[str]:
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", " ".join(text.split()))
+        if sentence.strip()
+    ]
+    if prioritize_layout:
+        layout_terms = (
+            ("visible", 6),
+            ("in frame", 6),
+            ("obscur", 2),
+            ("cover", 1),
+            ("between", 2),
+            ("left", 3),
+            ("right", 3),
+            ("center", 2),
+            ("position", 2),
+            ("stationary", 2),
+        )
+        sentences = [
+            sentence
+            for _, sentence in sorted(
+                enumerate(sentences),
+                key=lambda item: (
+                    -sum(
+                        weight
+                        for term, weight in layout_terms
+                        if term in item[1].casefold()
+                    ),
+                    item[0],
+                ),
+            )
+        ]
+    return [f"{label}: {sentence}" for sentence in sentences]
 
 
 def _compact_prop_prompt(prop: Prop) -> str:
@@ -343,7 +398,10 @@ def build_scene_image_prompt(
     storyboard: Storyboard,
     scene: Scene,
 ) -> str:
-    required, optional = _scene_image_prompt_components(storyboard, scene)
+    required, optional = _scene_image_prompt_components(
+        storyboard,
+        scene,
+    )
     return _fit_image_prompt(
         required,
         "Scene image prompt",
@@ -427,16 +485,11 @@ def build_continuity_image_prompt(
             "Scene 2 requires continuity reference frames."
         )
 
-    continuity_instruction = (
-        "Use reference for identity and setting; honor this initial state."
-        if scene.character_ids
-        else (
-            "Use reference for subject identity and setting; honor this "
-            "initial state."
-        )
+    required, optional = _scene_image_prompt_components(
+        storyboard,
+        scene,
+        continuity=True,
     )
-    required, optional = _scene_image_prompt_components(storyboard, scene)
-    required.append(continuity_instruction)
     return _fit_image_prompt(
         required,
         "Continuity image prompt",

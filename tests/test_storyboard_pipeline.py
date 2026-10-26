@@ -8,6 +8,7 @@ from PIL import Image
 from app.storyboard.io import parse_storyboard_json
 from app.video import pipeline
 from app.video.composer import VideoInfo
+from app.video.providers import VideoGenerationResult
 from tests.test_image_prompt import _circuit_storyboard
 from tests.test_storyboard_io import _storyboard_data
 
@@ -108,6 +109,7 @@ def test_motion_prompt_preserves_required_scene_content_before_optional_style(
     storyboard = _circuit_storyboard()
     storyboard.project.visual_style = "educational style " * 300
     scene = storyboard.scenes[0]
+    scene.camera.lens = "35mm natural perspective"
     monkeypatch.setattr(pipeline, "VIDEO_PROVIDER", "runway")
 
     prompt = pipeline._build_motion_prompt(storyboard, scene)
@@ -117,6 +119,7 @@ def test_motion_prompt_preserves_required_scene_content_before_optional_style(
     assert scene.continuity.ending_state in prompt
     assert scene.visual_description in prompt
     assert scene.camera.shot_type in prompt
+    assert scene.camera.lens in prompt
     assert len(prompt.encode("utf-16-le")) // 2 <= 1000
     assert "educational style educational style" not in prompt
 
@@ -161,6 +164,10 @@ def test_motion_prompt_preserves_complete_core_and_priority_negatives(
     scene.negative_prompt = (
         "No camera cuts; no reverse flow; no extra switches; no text."
     )
+    scene.blocking = (
+        "Keep the battery, wire, switch, and bulb visible together in a "
+        "left-to-right layout."
+    )
     scene.visual_description = "Detailed visual context " * 250
     monkeypatch.setattr(pipeline, "VIDEO_PROVIDER", "runway")
     caplog.set_level("INFO", logger="app.video.pipeline")
@@ -172,6 +179,9 @@ def test_motion_prompt_preserves_complete_core_and_priority_negatives(
     assert scene.action in prompt
     assert scene.continuity.ending_state in prompt
     assert scene.camera.movement in prompt
+    assert "visible together in a left-to-right layout" in prompt.lower()
+    assert "Props: Battery; Red wire; Switch; Bulb." in prompt
+    assert "No extra or duplicate props." in prompt
     assert "No camera cuts" in prompt
     assert "no reverse flow" in prompt
     assert any(
@@ -181,9 +191,14 @@ def test_motion_prompt_preserves_complete_core_and_priority_negatives(
     )
 
 
+@pytest.mark.parametrize(
+    "continuity_mode",
+    ["previous_frame", "img2img"],
+)
 def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
     monkeypatch,
     tmp_path,
+    continuity_mode,
 ):
     storyboard = _circuit_storyboard()
     storyboard.project.duration_seconds = 15
@@ -243,6 +258,16 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
         output_path.write_bytes(
             f"normalized:{output_path.stem}".encode("utf-8")
         )
+        kwargs["on_generation_result"](
+            VideoGenerationResult(
+                video_path=output_path,
+                provider="runway",
+                generation_id=f"task-{output_path.stem}",
+                duration_seconds=5,
+                metadata={"model": "gen4.5"},
+            ),
+            image_path,
+        )
         return str(output_path)
 
     def fake_normalize(source, output, **kwargs):
@@ -266,6 +291,11 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
         Path(kwargs["output_path"]).write_bytes(b"final")
 
     monkeypatch.setattr(pipeline, "VIDEO_PROVIDER", "runway")
+    monkeypatch.setattr(
+        pipeline,
+        "CONTINUITY_IMAGE_MODE",
+        continuity_mode,
+    )
     monkeypatch.setattr(pipeline, "generate_scene_image", fake_generate_image)
     monkeypatch.setattr(
         pipeline,
@@ -302,25 +332,36 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
         b"normalized:scene_001",
         b"normalized:scene_002",
     ]
-    assert [pixel for _, pixel in img2img_handoffs] == [
-        (1, 10, 20),
-        (2, 10, 20),
-    ]
-    assert [path for path, _ in img2img_handoffs] == [
-        tmp_path / "scene_001_end_frames" / "frame_000119.png",
-        tmp_path / "scene_002_end_frames" / "frame_000119.png",
-    ]
+    if continuity_mode == "img2img":
+        assert [pixel for _, pixel in img2img_handoffs] == [
+            (1, 10, 20),
+            (2, 10, 20),
+        ]
+        assert [path for path, _ in img2img_handoffs] == [
+            tmp_path / "scene_001_end_frames" / "frame_000119.png",
+            tmp_path / "scene_002_end_frames" / "frame_000119.png",
+        ]
+    else:
+        assert img2img_handoffs == []
     assert [path for path, _ in video_first_frames] == [
         tmp_path / "scene_001.png",
         tmp_path / "scene_002.png",
         tmp_path / "scene_003.png",
     ]
+    expected_later_pixels = (
+        ((21, 30, 40), (22, 30, 40))
+        if continuity_mode == "img2img"
+        else ((1, 10, 20), (2, 10, 20))
+    )
     assert [pixel for _, pixel in video_first_frames] == [
         (1, 1, 1),
-        (21, 30, 40),
-        (22, 30, 40),
+        *expected_later_pixels,
     ]
-    assert img2img_strengths == [pipeline.IMAGE_TO_IMAGE_STRENGTH] * 2
+    assert img2img_strengths == (
+        [pipeline.IMAGE_TO_IMAGE_STRENGTH] * 2
+        if continuity_mode == "img2img"
+        else []
+    )
     scene_two_diagnostics = json.loads(
         (tmp_path / "scene_002_generation.json").read_text(encoding="utf-8")
     )
@@ -328,12 +369,22 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
     assert scene_two_diagnostics["reference_source_video_path"] == str(
         scene_one_video
     )
-    assert scene_two_diagnostics["reference_frame_used_for_img2img"] == str(
-        tmp_path / "scene_001_end_frames" / "frame_000119.png"
+    assert scene_two_diagnostics["reference_frame_used_for_img2img"] == (
+        str(tmp_path / "scene_001_end_frames" / "frame_000119.png")
+        if continuity_mode == "img2img"
+        else None
     )
-    assert scene_two_diagnostics["continuity_image_generation_mode"] == "img2img"
+    assert scene_two_diagnostics["continuity_image_generation_mode"] == (
+        continuity_mode
+    )
+    assert scene_two_diagnostics["image_prompt_applied"] is (
+        continuity_mode == "img2img"
+    )
     assert scene_two_diagnostics["first_frame_image_path"] == str(
         tmp_path / "scene_002.png"
+    )
+    assert scene_two_diagnostics["provider_generation_id"] == (
+        "task-scene_002"
     )
     boundary = scene_two_diagnostics["continuity_boundary"]
     assert boundary["status"] == "completed"
@@ -355,14 +406,33 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
     assert boundary["candidate_timestamp_basis"] == (
         "frame_index / normalized CFR frame rate"
     )
-    assert boundary["img2img_input_path"] == str(
-        tmp_path / "scene_001_end_frames" / "frame_000119.png"
+    assert boundary["img2img_input_path"] == (
+        str(tmp_path / "scene_001_end_frames" / "frame_000119.png")
+        if continuity_mode == "img2img"
+        else None
     )
-    assert boundary["img2img_output_path"] == str(tmp_path / "scene_002.png")
+    assert boundary["img2img_output_path"] == (
+        str(tmp_path / "scene_002.png")
+        if continuity_mode == "img2img"
+        else None
+    )
     assert boundary["provider_input_image_path"] == str(
         tmp_path / "scene_002.png"
     )
-    assert boundary["img2img_strength"] == pipeline.IMAGE_TO_IMAGE_STRENGTH
+    assert boundary["provider_input_image_sha256"] == pipeline._sha256_file(
+        tmp_path / "scene_002.png"
+    )
+    assert boundary["provider_input_matches_reference"] is (
+        continuity_mode == "previous_frame"
+    )
+    assert boundary["img2img_strength"] == (
+        pipeline.IMAGE_TO_IMAGE_STRENGTH
+        if continuity_mode == "img2img"
+        else None
+    )
+    assert boundary["continuity_image_matches_reference"] is (
+        continuity_mode == "previous_frame"
+    )
     assert scene_two_diagnostics["video_prompt_character_count"] <= (
         scene_two_diagnostics["video_prompt_character_limit"]
     )
@@ -371,3 +441,46 @@ def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
     )
     assert scene_two_diagnostics["transition_strategy"] == "hard_cut"
     assert final_path.read_bytes() == b"final"
+
+
+def test_declined_image_review_stops_before_video_generation(
+    monkeypatch,
+    tmp_path,
+):
+    storyboard = _circuit_storyboard()
+    reviewed = []
+
+    def fake_generate_image(**kwargs):
+        Image.new("RGB", (32, 24), (1, 2, 3)).save(kwargs["output_path"])
+
+    def review_image(scene, image_path):
+        with Image.open(image_path) as image:
+            image.verify()
+        reviewed.append(scene.id)
+        return False
+
+    monkeypatch.setattr(pipeline, "generate_scene_image", fake_generate_image)
+    monkeypatch.setattr(
+        pipeline,
+        "generate_scene_video",
+        lambda **_kwargs: pytest.fail(
+            "Video generation must not start after review is declined."
+        ),
+    )
+
+    with pytest.raises(pipeline.ImageReviewDeclined):
+        pipeline.generate_video_from_storyboard(
+            storyboard,
+            output_dir=tmp_path,
+            image_review_callback=review_image,
+        )
+
+    assert reviewed == ["SCENE_001"]
+    diagnostics = json.loads(
+        (tmp_path / "scene_001_generation.json").read_text(encoding="utf-8")
+    )
+    assert diagnostics["image_review_status"] == "declined"
+    assert diagnostics["error"] == (
+        "Image review declined before video generation."
+    )
+    assert not (tmp_path / "scene_001.mp4").exists()

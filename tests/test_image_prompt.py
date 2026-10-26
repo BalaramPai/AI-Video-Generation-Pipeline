@@ -171,7 +171,6 @@ def test_scene_image_prompt_supports_character_free_subject():
 
     assert "engine" in prompt.lower()
     assert "start: the engine cover is closed" in prompt.lower()
-    assert "action: the engine cover opens" in prompt.lower()
     assert "pistons visible" in prompt.lower()
     assert _token_count(prompt) <= IMAGE_PROMPT_MAX_TOKENS
 
@@ -305,7 +304,7 @@ def _circuit_storyboard(*, long_optional_context=False):
     )
 
 
-def test_image_prompt_preserves_circuit_state_action_and_only_relevant_props():
+def test_image_prompt_preserves_circuit_start_state_and_relevant_props():
     storyboard = _circuit_storyboard()
     prompt = build_scene_image_prompt(storyboard, storyboard.scenes[0])
 
@@ -314,8 +313,8 @@ def test_image_prompt_preserves_circuit_state_action_and_only_relevant_props():
         "Red wire",
         "Switch",
         "Bulb",
-        "open switch",
-        "bulb stays unlit",
+        "switch open",
+        "bulb unlit",
         "left-to-right in one connected circuit",
     ):
         assert detail.lower() in prompt.lower()
@@ -328,12 +327,13 @@ def test_long_optional_style_and_location_do_not_remove_scene_facts():
     prompt = build_scene_image_prompt(storyboard, storyboard.scenes[0])
 
     assert "switch lever open" in prompt.lower()
-    assert "bulb stays unlit" in prompt.lower()
+    assert "bulb unlit" in prompt.lower()
     assert "left-to-right in one connected circuit" in prompt.lower()
     assert _token_count(prompt) <= IMAGE_PROMPT_MAX_TOKENS
 
 
 def test_overlong_required_image_facts_are_balanced_and_warned(caplog):
+    caplog.set_level("INFO", logger="app.assets.image_generator")
     storyboard = _circuit_storyboard()
     scene = storyboard.scenes[0]
     scene.action = "The " + "detailed action " * 100
@@ -342,13 +342,27 @@ def test_overlong_required_image_facts_are_balanced_and_warned(caplog):
 
     assert _token_count(prompt) <= IMAGE_PROMPT_MAX_TOKENS
     assert "Start:" in prompt
-    assert "Action:" in prompt
-    assert "Layout:" in prompt
+    assert "Visual:" in prompt
     assert "switch lever open" in prompt.lower()
+    assert "Action: The detailed action detailed action" not in prompt
     assert any(
-        "shortened" in record.message.lower()
+        record.message
+        == "Optional Stable Diffusion prompt context omitted to preserve "
+        "required scene facts"
+        and "action" in record.omitted_context
         for record in caplog.records
     )
+
+
+def test_image_prompt_fails_when_no_complete_section_fits():
+    with pytest.raises(
+        ValueError,
+        match="could not fit any complete required section",
+    ):
+        image_generator._fit_image_prompt(
+            ["Subject: " + "unbroken " * 500],
+            "Scene image prompt",
+        )
 
 
 def test_continuity_prompt_preserves_next_start_state_and_action():
@@ -361,7 +375,33 @@ def test_continuity_prompt_preserves_next_start_state_and_action():
 
     assert "same battery, wire, open switch, unlit bulb" in prompt.lower()
     assert "close switch; bulb lights" in prompt.lower()
-    assert "honor this initial state" in prompt.lower()
+    assert "preserve reference composition" in prompt.lower()
+    assert _token_count(prompt) <= IMAGE_PROMPT_MAX_TOKENS
+
+
+def test_continuity_prompt_prioritizes_visible_props_over_motion_detail():
+    storyboard = _circuit_storyboard()
+    scene = storyboard.scenes[0]
+    scene.blocking = (
+        "The battery stays centered. Keep the battery, wire, switch, and "
+        "bulb visible together."
+    )
+    scene.continuity.required_start_state = (
+        "The same circuit remains in its exact previous state. "
+        + "Preserve every original component and position. " * 5
+    )
+    scene.action = "Continue the demonstration " * 20
+
+    prompt = build_continuity_image_prompt(
+        storyboard,
+        scene,
+        ["previous-final-frame.png"],
+    )
+
+    assert "preserve reference composition" in prompt.lower()
+    assert "visible together" in prompt.lower()
+    for prop in ("Battery", "Red wire", "Switch", "Bulb"):
+        assert prop.lower() in prompt.lower()
     assert _token_count(prompt) <= IMAGE_PROMPT_MAX_TOKENS
 
 

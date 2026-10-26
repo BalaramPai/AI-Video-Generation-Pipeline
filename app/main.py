@@ -3,8 +3,11 @@ import sys
 from pathlib import Path
 
 from app.storyboard.io import load_storyboard_file, parse_storyboard_json
-from app.storyboard.models import Storyboard
-from app.video.pipeline import generate_video_from_storyboard
+from app.storyboard.models import Scene, Storyboard
+from app.video.pipeline import (
+    ImageReviewDeclined,
+    generate_video_from_storyboard,
+)
 
 
 def _read_pasted_storyboard() -> Storyboard:
@@ -41,6 +44,16 @@ def _load_input_storyboard(file_argument: str | None) -> Storyboard:
     return _read_pasted_storyboard()
 
 
+def _review_scene_image(scene: Scene, image_path: Path) -> bool:
+    print(
+        f"\nReview the first-frame image for {scene.id}: {image_path}\n"
+        "Open the image and confirm it is the composition you want to send "
+        "to the video provider."
+    )
+    answer = input("Generate this scene's video? [Y/n] ").strip().lower()
+    return answer in {"", "y", "yes"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate a video from an existing storyboard JSON."
@@ -58,6 +71,14 @@ def main() -> None:
         default="outputs",
         help="Directory for scene assets and final video (default: outputs).",
     )
+    parser.add_argument(
+        "--review-images",
+        action="store_true",
+        help=(
+            "Pause before each new video request so you can inspect its "
+            "first-frame image. Existing Runway tasks resume without review."
+        ),
+    )
     args = parser.parse_args()
 
     storyboard = _load_input_storyboard(args.storyboard)
@@ -65,7 +86,13 @@ def main() -> None:
         output_path = generate_video_from_storyboard(
             storyboard,
             output_dir=Path(args.output_dir),
+            image_review_callback=(
+                _review_scene_image if args.review_images else None
+            ),
         )
+    except ImageReviewDeclined as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return
     except KeyboardInterrupt:
         task_states = sorted(
             Path(args.output_dir).glob("*.runway-task.json")

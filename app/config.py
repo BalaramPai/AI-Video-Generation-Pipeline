@@ -19,6 +19,15 @@ if (
         "IMAGE_TO_IMAGE_STRENGTH must be a finite value between 0.0 and 1.0."
     )
 
+CONTINUITY_IMAGE_MODE = os.getenv(
+    "CONTINUITY_IMAGE_MODE",
+    "previous_frame",
+).strip().lower()
+if CONTINUITY_IMAGE_MODE not in {"previous_frame", "img2img"}:
+    raise ValueError(
+        "CONTINUITY_IMAGE_MODE must be 'previous_frame' or 'img2img'."
+    )
+
 VIDEO_PROVIDER = os.getenv("VIDEO_PROVIDER", "runway").strip().lower()
 RUNWAY_API_SECRET = os.getenv("RUNWAYML_API_SECRET")
 RUNWAY_MODEL = os.getenv("RUNWAY_MODEL", "gen4.5").strip()

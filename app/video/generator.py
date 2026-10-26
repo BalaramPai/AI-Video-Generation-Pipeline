@@ -1,8 +1,9 @@
+import hashlib
 import logging
 from fractions import Fraction
 from pathlib import Path
 from threading import Event
-from typing import Sequence
+from typing import Callable, Sequence
 
 from PIL import Image, UnidentifiedImageError
 
@@ -15,10 +16,13 @@ from app.video.composer import (
     normalize_video_clip,
     probe_video,
 )
+from app.video.providers.base import VideoGenerationResult
 from app.video.providers.factory import create_video_provider
 
 
 logger = logging.getLogger(__name__)
+
+GenerationResultCallback = Callable[[VideoGenerationResult, Path], None]
 
 
 def _validate_first_frame_image(image: Path) -> tuple[int, int]:
@@ -55,6 +59,7 @@ def generate_scene_video(
     target_frame_rate: Fraction | str | None = None,
     target_frame_count: int | None = None,
     normalize_output: bool = True,
+    on_generation_result: GenerationResultCallback | None = None,
 ) -> str:
     image = Path(image_path)
     image_width, image_height = _validate_first_frame_image(image)
@@ -134,6 +139,18 @@ def generate_scene_video(
             aspect_ratio=aspect_ratio,
             cancel_event=cancel_event,
         )
+        if on_generation_result is not None:
+            image_sha256 = hashlib.sha256(image.read_bytes()).hexdigest()
+            logger.info(
+                "Video provider generation completed",
+                extra={
+                    "provider": result.provider,
+                    "generation_id": result.generation_id,
+                    "first_frame": str(image),
+                    "first_frame_sha256": image_sha256,
+                },
+            )
+            on_generation_result(result, image)
         generated_path = result.video_path
 
     if (target_frame_rate is None) != (target_frame_count is None):

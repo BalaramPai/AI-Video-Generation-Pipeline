@@ -178,6 +178,7 @@ def test_generate_scene_video_normalizes_provider_duration(
             )
 
     normalization_calls = []
+    generation_results = []
     monkeypatch.setattr(video_generator, "VIDEO_PROVIDER", "veo")
     monkeypatch.setattr(video_generator, "create_video_provider", FakeProvider)
     monkeypatch.setattr(
@@ -208,9 +209,14 @@ def test_generate_scene_video_normalizes_provider_duration(
         output_path=str(output_path),
         duration_seconds=5,
         aspect_ratio="9:16",
+        on_generation_result=lambda result, first_frame: (
+            generation_results.append((result, first_frame))
+        ),
     )
 
     assert len(normalization_calls) == 1
+    assert generation_results[0][0].generation_id == "operations/test"
+    assert generation_results[0][1] == image_path
     assert normalization_calls[0][1] == {
         "target_frame_rate": Fraction(24, 1),
         "target_frame_count": 120,
@@ -307,13 +313,87 @@ def test_generate_scene_video_rejects_corrupt_first_frame_before_provider(
         "create_video_provider",
         lambda *_: pytest.fail("Provider must not receive an invalid image"),
     )
-
     with pytest.raises(ValueError, match="not a readable image"):
         generate_scene_video(
             image_path=str(image_path),
             prompt="Continue the scene.",
             output_path=str(tmp_path / "scene.mp4"),
         )
+
+
+def test_generate_scene_video_reports_uploaded_first_frame_to_provider(
+    monkeypatch,
+    tmp_path,
+):
+    image_path = tmp_path / "scene.png"
+    reference_path = tmp_path / "reference.png"
+    output_path = tmp_path / "scene.mp4"
+    _write_test_image(image_path)
+    _write_test_image(reference_path, (9, 8, 7))
+
+    class FakeProvider:
+        name = "veo"
+        capabilities = VideoProviderCapabilities(
+            text_to_video=False,
+            image_to_video=True,
+            reference_images=True,
+            first_frame=True,
+            last_frame=True,
+            video_extension=False,
+            supported_aspect_ratios=("16:9",),
+        )
+
+        def __init__(self, _provider_name):
+            pass
+
+        def generate_video(self, **kwargs):
+            assert kwargs["first_frame"] == image_path
+            assert kwargs["reference_images"] == (reference_path,)
+            output_path.write_bytes(b"video")
+            return VideoGenerationResult(
+                video_path=output_path,
+                provider="veo",
+                generation_id="operations/reference-test",
+                duration_seconds=5,
+            )
+
+    monkeypatch.setattr(video_generator, "VIDEO_PROVIDER", "veo")
+    monkeypatch.setattr(video_generator, "create_video_provider", FakeProvider)
+    monkeypatch.setattr(
+        video_generator,
+        "probe_video",
+        lambda _: composer.VideoInfo(
+            frame_rate=Fraction(24, 1),
+            frame_count=120,
+            duration_seconds=Fraction(5, 1),
+            video_codec="h264",
+            width=1280,
+            height=720,
+            pixel_format="yuv420p",
+            audio_codec=None,
+            audio_sample_rate=None,
+            audio_channels=None,
+        ),
+    )
+    monkeypatch.setattr(
+        video_generator,
+        "normalize_video_clip",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = []
+    video_generator.generate_scene_video(
+        image_path=str(image_path),
+        prompt="Continue the scene.",
+        output_path=str(output_path),
+        reference_images=(str(reference_path),),
+        on_generation_result=lambda generation, first_frame: result.append(
+            (generation, first_frame)
+        ),
+    )
+
+    assert result[0][0].generation_id == "operations/reference-test"
+    assert result[0][1] == image_path
 
 
 def test_trim_video_writes_normalized_output(monkeypatch, tmp_path):

@@ -33,5 +33,5 @@ def test_generate_scene_image_uses_built_storyboard_prompt(
     assert result == str(output_path)
     assert output_path.is_file()
     assert captured["prompt"] == prompt
-    assert "open switch" in prompt.lower()
-    assert "bulb stays unlit" in prompt.lower()
+    assert "switch open" in prompt.lower()
+    assert "bulb unlit" in prompt.lower()

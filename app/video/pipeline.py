@@ -1,6 +1,8 @@
+import hashlib
 import json
 import logging
 import re
+import shutil
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable
@@ -13,6 +15,7 @@ from app.assets.image_generator import (
     generate_scene_image_from_reference,
 )
 from app.config import (
+    CONTINUITY_IMAGE_MODE,
     IMAGE_TO_IMAGE_STRENGTH,
     RUNWAY_MODEL,
     VEO_MODEL,
@@ -29,9 +32,16 @@ from app.video.composer import (
 from app.video.continuity import build_continuity_reference
 from app.video.frame_extractor import extract_last_frames
 from app.video.generator import generate_scene_video
+from app.video.providers.base import VideoGenerationResult
 
 
 logger = logging.getLogger(__name__)
+
+ImageReviewCallback = Callable[[Scene, Path], bool]
+
+
+class ImageReviewDeclined(RuntimeError):
+    """Raised when a user declines the pre-generation image review."""
 
 
 def _selected_video_model() -> str:
@@ -53,6 +63,14 @@ def _normalize_state_text(value: str) -> str:
     return " ".join(value.casefold().strip().rstrip(". ").split())
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as image_file:
+        for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _fit_required_motion_prompt(
     components: list[str],
     maximum_characters: int,
@@ -68,6 +86,40 @@ def _fit_required_motion_prompt(
             "UTF-16 characters. Required details were not truncated."
         )
     return prompt
+
+
+def _layout_prompt_sentences(blocking: str) -> list[str]:
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", " ".join(blocking.split()))
+        if sentence.strip()
+    ]
+    layout_terms = (
+        ("visible", 6),
+        ("in frame", 6),
+        ("obscur", 2),
+        ("cover", 1),
+        ("between", 2),
+        ("left", 3),
+        ("right", 3),
+        ("center", 2),
+        ("position", 2),
+        ("stationary", 2),
+    )
+    return [
+        sentence
+        for _, sentence in sorted(
+            enumerate(sentences),
+            key=lambda item: (
+                -sum(
+                    weight
+                    for term, weight in layout_terms
+                    if term in item[1].casefold()
+                ),
+                item[0],
+            ),
+        )
+    ]
 
 
 def _build_motion_prompt(
@@ -92,6 +144,13 @@ def _build_motion_prompt(
             f"{character.appearance.hair}, "
             f"{character.appearance.facial_features}, "
             f"{character.appearance.clothing}"
+        )
+        for character in characters
+    )
+    runway_character_lock = "; ".join(
+        (
+            f"{character.name}, age {character.appearance.age}, "
+            f"{character.appearance.hair}, {character.appearance.clothing}"
         )
         for character in characters
     )
@@ -121,6 +180,11 @@ def _build_motion_prompt(
             + "; preserve its shape and appearance throughout the shot."
         )
     )
+    runway_subject_instruction = (
+        f"Identity lock: {runway_character_lock}."
+        if runway_character_lock
+        else subject_instruction
+    )
     appearance_instruction = (
         "Preserve faces, proportions, wardrobe, lighting, composition, "
         "and prop positions; animate only this action naturally."
@@ -131,13 +195,22 @@ def _build_motion_prompt(
         )
     )
     core_components = [
-        subject_instruction,
+        (
+            runway_subject_instruction
+            if VIDEO_PROVIDER == "runway"
+            else subject_instruction
+        ),
         f"Starting state: {scene.continuity.required_start_state}.",
         f"Action: {scene.action}.",
         f"Ending state: {scene.continuity.ending_state}.",
         (
             f"Camera: {scene.camera.shot_type}, {scene.camera.angle}, "
-            f"{scene.camera.movement}, {scene.camera.lens or 'natural lens'}."
+            f"{scene.camera.movement}"
+            + (
+                f", {scene.camera.lens or 'natural lens'}."
+                if VIDEO_PROVIDER != "runway"
+                else "."
+            )
         ),
     ]
     required_components = [
@@ -207,6 +280,7 @@ def _build_motion_prompt(
                 "teleport",
                 "different",
                 "extra",
+                "duplicate",
                 "missing",
                 "rearranged",
                 "geometry",
@@ -236,10 +310,16 @@ def _build_motion_prompt(
         )
     ]
 
+    prop_instruction = (
+        "Props: "
+        + "; ".join(prop.name for prop in relevant_props)
+        + ". No extra or duplicate props."
+        if relevant_props
+        else ""
+    )
     priority_components = [f"Visual: {scene.visual_description}."]
     optional_components = [
         f"Relevant props: {prop_lock}." if prop_lock else "",
-        f"Blocking: {scene.blocking}." if scene.blocking else "",
         f"Subject state: {scene.continuity.character_state}.",
         f"Environment: {scene.continuity.environment_state}.",
         f"Location and light: {location.name}, {location.lighting}.",
@@ -255,6 +335,28 @@ def _build_motion_prompt(
     prompt = required_prompt
     omitted_context: list[str] = []
     omitted_negative_constraints: list[str] = []
+    blocking_sentences = _layout_prompt_sentences(scene.blocking)
+    omitted_blocking = len(blocking_sentences) > 1
+    if prop_instruction:
+        candidate = f"{prompt} {prop_instruction}"
+        if _utf16_length(candidate) <= maximum_prompt_characters:
+            prompt = candidate
+        else:
+            omitted_context.append("Prop identities and duplicate safeguard")
+    for sentence in blocking_sentences[:1]:
+        candidate = f"{prompt} Blocking: {sentence}"
+        if _utf16_length(candidate) <= maximum_prompt_characters:
+            prompt = candidate
+        else:
+            omitted_blocking = True
+    if omitted_blocking:
+        omitted_context.append("Additional blocking details")
+    if scene.camera.lens:
+        candidate = f"{prompt} Lens: {scene.camera.lens}."
+        if _utf16_length(candidate) <= maximum_prompt_characters:
+            prompt = candidate
+        else:
+            omitted_context.append("Camera lens")
     fitted_negative: list[str] = []
     for clause in negative_clauses:
         candidate_clauses = [*fitted_negative, clause]
@@ -331,6 +433,7 @@ def _build_motion_prompt(
 def generate_video_from_storyboard(
     storyboard: Storyboard,
     output_dir: str | Path = Path("outputs"),
+    image_review_callback: ImageReviewCallback | None = None,
 ) -> Path:
     """Generate a video from a validated storyboard without creating one."""
     validate_storyboard_continuity(storyboard)
@@ -376,7 +479,9 @@ def generate_video_from_storyboard(
                 "num_inference_steps": 35,
                 "guidance_scale": 6.5,
                 "image_to_image_strength": (
-                    IMAGE_TO_IMAGE_STRENGTH if index > 0 else None
+                    IMAGE_TO_IMAGE_STRENGTH
+                    if index > 0 and CONTINUITY_IMAGE_MODE == "img2img"
+                    else None
                 ),
             },
             "video_generation_parameters": {
@@ -394,12 +499,21 @@ def generate_video_from_storyboard(
                 ),
             },
             "image_prompt": None,
+            "image_prompt_applied": index == 0,
             "negative_prompt": negative_prompt,
             "dialogue": scene.dialogue,
             "audio_generation": "not supported by this video pipeline",
             "image_prompt_path": str(image_prompt_path),
             "scene_image_path": str(image_path),
             "reference_frame_paths": [],
+            "continuity_image_generation_mode": (
+                CONTINUITY_IMAGE_MODE if index > 0 else "text_to_image"
+            ),
+            "continuity_reference_sha256": None,
+            "first_frame_image_sha256": None,
+            "provider_generation_id": None,
+            "provider_generation_metadata": {},
+            "image_review_status": "not_requested",
             "video_prompt": None,
             "video_prompt_path": str(motion_prompt_path),
             "video_prompt_character_count": None,
@@ -464,6 +578,8 @@ def generate_video_from_storyboard(
                 },
             )
             try:
+                if image_path.exists():
+                    image_path.unlink()
                 generate_scene_image(
                     prompt=image_prompt,
                     output_path=str(image_path),
@@ -496,7 +612,11 @@ def generate_video_from_storyboard(
                 "candidate_frames": [],
                 "selected_frame": None,
                 "img2img_input_path": None,
-                "img2img_output_path": str(image_path),
+                "img2img_output_path": (
+                    str(image_path)
+                    if CONTINUITY_IMAGE_MODE == "img2img"
+                    else None
+                ),
                 "provider_input_image_path": str(image_path),
             }
             diagnostics["continuity_boundary"] = boundary
@@ -560,13 +680,15 @@ def generate_video_from_storyboard(
             continuity_references = (reference_frames[-1],)
             selected_candidate = candidate_frames[-1]
             boundary["selected_frame"] = selected_candidate
-            boundary["img2img_input_path"] = continuity_references[0]
-            boundary["img2img_strength"] = IMAGE_TO_IMAGE_STRENGTH
             diagnostics["reference_source_video_path"] = previous_video
-            diagnostics["reference_frame_used_for_img2img"] = (
-                continuity_references[0]
+            reference_path = Path(continuity_references[0])
+            reference_sha256 = _sha256_file(reference_path)
+            boundary["continuity_image_mode"] = CONTINUITY_IMAGE_MODE
+            boundary["reference_frame_sha256"] = reference_sha256
+            diagnostics["continuity_reference_sha256"] = reference_sha256
+            diagnostics["continuity_image_generation_mode"] = (
+                CONTINUITY_IMAGE_MODE
             )
-            diagnostics["continuity_image_generation_mode"] = "img2img"
             image_prompt = build_continuity_image_prompt(
                 storyboard=storyboard,
                 scene=scene,
@@ -584,40 +706,80 @@ def generate_video_from_storyboard(
             )
             image_prompt_path.write_text(image_prompt, encoding="utf-8")
             _write_scene_diagnostics(diagnostics_path, diagnostics)
-            logger.info(
-                "Generating continuity-adjusted scene image",
-                extra={
-                    "scene_id": scene.id,
-                    "duration_seconds": scene.duration_seconds,
-                    "image_prompt": image_prompt,
-                    "negative_prompt": negative_prompt,
-                    "reference_image_path": reference_frames[-1],
-                    "image_path": str(image_path),
-                },
-            )
             try:
-                generate_scene_image_from_reference(
-                    prompt=image_prompt,
-                    reference_image_path=reference_frames[-1],
-                    output_path=str(image_path),
-                    aspect_ratio=storyboard.project.aspect_ratio,
-                    negative_prompt=negative_prompt,
-                    scene_id=scene.id,
-                    strength=IMAGE_TO_IMAGE_STRENGTH,
+                if image_path.exists():
+                    image_path.unlink()
+                if CONTINUITY_IMAGE_MODE == "img2img":
+                    boundary["img2img_input_path"] = str(reference_path)
+                    boundary["img2img_strength"] = IMAGE_TO_IMAGE_STRENGTH
+                    diagnostics["reference_frame_used_for_img2img"] = str(
+                        reference_path
+                    )
+                    diagnostics["image_prompt_applied"] = True
+                    logger.info(
+                        "Generating continuity-adjusted scene image from "
+                        "the extracted predecessor frame",
+                        extra={
+                            "scene_id": scene.id,
+                            "reference_image_path": str(reference_path),
+                            "image_path": str(image_path),
+                            "strength": IMAGE_TO_IMAGE_STRENGTH,
+                        },
+                    )
+                    generate_scene_image_from_reference(
+                        prompt=image_prompt,
+                        reference_image_path=str(reference_path),
+                        output_path=str(image_path),
+                        aspect_ratio=storyboard.project.aspect_ratio,
+                        negative_prompt=negative_prompt,
+                        scene_id=scene.id,
+                        strength=IMAGE_TO_IMAGE_STRENGTH,
+                    )
+                    boundary["status"] = "img2img_completed"
+                else:
+                    boundary["img2img_input_path"] = None
+                    boundary["img2img_strength"] = None
+                    diagnostics["reference_frame_used_for_img2img"] = None
+                    diagnostics["image_prompt_applied"] = False
+                    shutil.copyfile(reference_path, image_path)
+                    boundary["status"] = "previous_frame_copied"
+                    logger.info(
+                        "Using the extracted predecessor frame directly as "
+                        "the next scene's first-frame image",
+                        extra={
+                            "scene_id": scene.id,
+                            "source_video": previous_video,
+                            "reference_image_path": str(reference_path),
+                            "first_frame_image_path": str(image_path),
+                            "image_sha256": reference_sha256,
+                        },
+                    )
+                continuity_image_sha256 = _sha256_file(image_path)
+                boundary["continuity_image_sha256"] = (
+                    continuity_image_sha256
                 )
-                boundary["status"] = "img2img_completed"
-                boundary["img2img_output_path"] = str(image_path)
+                boundary["continuity_image_matches_reference"] = (
+                    continuity_image_sha256 == reference_sha256
+                )
+                diagnostics["first_frame_image_sha256"] = (
+                    continuity_image_sha256
+                )
+                boundary["img2img_output_path"] = (
+                    str(image_path)
+                    if CONTINUITY_IMAGE_MODE == "img2img"
+                    else None
+                )
                 _write_scene_diagnostics(diagnostics_path, diagnostics)
             except Exception as exc:
-                boundary["status"] = "img2img_failed"
+                boundary["status"] = "continuity_image_failed"
                 boundary["error"] = f"{type(exc).__name__}: {exc}"
                 diagnostics["error"] = (
-                    f"Continuity image generation failed: "
+                    f"Continuity image preparation failed: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 _write_scene_diagnostics(diagnostics_path, diagnostics)
                 logger.exception(
-                    "Continuity image generation failed",
+                    "Continuity image preparation failed",
                     extra={"scene_id": scene.id},
                 )
                 raise
@@ -646,6 +808,62 @@ def generate_video_from_storyboard(
         diagnostics["first_frame_image_path"] = str(image_path)
         diagnostics.setdefault("video_reference_images_submitted", [])
         _write_scene_diagnostics(diagnostics_path, diagnostics)
+        if image_review_callback is not None:
+            if VIDEO_PROVIDER == "runway" and runway_task_state_path.is_file():
+                diagnostics["image_review_status"] = (
+                    "skipped_existing_provider_task"
+                )
+                logger.info(
+                    "Skipping image review while resuming a saved Runway "
+                    "task; the provider will restore its submitted input "
+                    "image",
+                    extra={
+                        "scene_id": scene.id,
+                        "task_state_path": str(runway_task_state_path),
+                    },
+                )
+            elif image_review_callback(scene, image_path):
+                diagnostics["image_review_status"] = "approved"
+            else:
+                diagnostics["image_review_status"] = "declined"
+                diagnostics["error"] = (
+                    "Image review declined before video generation."
+                )
+                _write_scene_diagnostics(diagnostics_path, diagnostics)
+                raise ImageReviewDeclined(
+                    f"Image review declined for {scene.id}; "
+                    "no video request was made."
+                )
+            _write_scene_diagnostics(diagnostics_path, diagnostics)
+
+        def record_generation_result(
+            result: VideoGenerationResult,
+            provider_input_image: Path,
+        ) -> None:
+            actual_first_frame_sha256 = _sha256_file(
+                provider_input_image
+            )
+            diagnostics["provider_generation_id"] = result.generation_id
+            diagnostics["provider_generation_metadata"] = dict(
+                result.metadata
+            )
+            diagnostics["first_frame_image_sha256"] = (
+                actual_first_frame_sha256
+            )
+            if index > 0:
+                boundary = diagnostics["continuity_boundary"]
+                boundary["provider_input_image_path"] = str(
+                    provider_input_image
+                )
+                boundary["provider_input_image_sha256"] = (
+                    actual_first_frame_sha256
+                )
+                boundary["provider_input_matches_reference"] = (
+                    actual_first_frame_sha256
+                    == boundary["reference_frame_sha256"]
+                )
+            _write_scene_diagnostics(diagnostics_path, diagnostics)
+
         logger.info(
             "Generating scene video",
             extra={
@@ -674,6 +892,7 @@ def generate_video_from_storyboard(
                     else None
                 ),
                 normalize_output=index != 0,
+                on_generation_result=record_generation_result,
             )
         except KeyboardInterrupt:
             if index > 0:
