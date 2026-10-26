@@ -280,7 +280,14 @@ def test_generate_scene_video_uses_first_frame_when_provider_lacks_references(
             output_path=str(output_path),
             reference_images=(str(reference_path),),
         ) == str(output_path)
-    assert "does not accept separate reference images" in caplog.text
+    capability_log = next(
+        record
+        for record in caplog.records
+        if "does not accept separate reference images" in record.message
+    )
+    assert capability_log.first_frame == str(image_path)
+    assert capability_log.reference_images_submitted == []
+    assert capability_log.first_frame_is_uploaded_conditioning_image is True
 
 
 def test_trim_video_writes_normalized_output(monkeypatch, tmp_path):

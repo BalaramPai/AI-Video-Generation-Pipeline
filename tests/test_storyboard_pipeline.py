@@ -3,6 +3,7 @@ from fractions import Fraction
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from app.storyboard.io import parse_storyboard_json
 from app.video import pipeline
@@ -127,17 +128,185 @@ def test_motion_prompt_fits_overlong_required_content_and_warns(
     storyboard = _circuit_storyboard()
     scene = storyboard.scenes[0]
     scene.action = "perform " + "critical action " * 300
+    scene.negative_prompt = (
+        "No camera movement; no cuts; no extra filters."
+    )
     monkeypatch.setattr(pipeline, "VIDEO_PROVIDER", "runway")
+    caplog.set_level("INFO", logger="app.video.pipeline")
 
     prompt = pipeline._build_motion_prompt(storyboard, scene)
+    character_count = len(prompt.encode("utf-16-le")) // 2
 
-    assert len(prompt.encode("utf-16-le")) // 2 <= 1000
+    assert character_count <= 1000
     assert "Starting state:" in prompt
     assert "Action:" in prompt
     assert "Ending state:" in prompt
     assert "Visual:" in prompt
     assert "Camera:" in prompt
+    assert "No camera movement" in prompt
+    assert "no cuts" in prompt
     assert any(
         "shortened" in record.message.lower()
         for record in caplog.records
     )
+    final_prompt_log = next(
+        record
+        for record in caplog.records
+        if record.message == "Final assembled Runway motion prompt"
+    )
+    assert final_prompt_log.character_count == character_count
+    assert final_prompt_log.maximum_characters == 1000
+
+
+def test_later_scenes_use_verified_predecessor_video_frame_end_to_end(
+    monkeypatch,
+    tmp_path,
+):
+    storyboard = _circuit_storyboard()
+    storyboard.project.duration_seconds = 15
+    scene_three = storyboard.scenes[1].model_copy(deep=True)
+    scene_three.id = "SCENE_003"
+    scene_three.continuity.previous_scene_id = "SCENE_002"
+    scene_three.continuity.required_start_state = (
+        "The switch remains closed and the bulb remains lit."
+    )
+    scene_three.continuity.ending_state = (
+        "The circuit remains closed and the bulb remains lit."
+    )
+    scene_three.continuity.character_state = (
+        "The switch is closed and the bulb is lit."
+    )
+    storyboard.scenes.append(scene_three)
+    extracted_sources = []
+    img2img_handoffs = []
+    video_first_frames = []
+
+    def fake_generate_image(**kwargs):
+        Image.new("RGB", (32, 24), (1, 1, 1)).save(kwargs["output_path"])
+
+    def fake_extract_last_frames(video_path, output_dir, frame_count=5):
+        source = Path(video_path)
+        assert source.read_bytes().startswith(b"normalized:")
+        extracted_sources.append(source)
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        reference = output / "frame_000119.png"
+        color = (len(extracted_sources), 10, 20)
+        Image.new("RGB", (32, 24), color).save(reference)
+        return [str(reference)]
+
+    def fake_generate_from_reference(**kwargs):
+        reference = Path(kwargs["reference_image_path"])
+        with Image.open(reference) as image:
+            image.load()
+            img2img_handoffs.append((reference, image.getpixel((0, 0))))
+        Image.new(
+            "RGB",
+            (32, 24),
+            (20 + len(img2img_handoffs), 30, 40),
+        ).save(kwargs["output_path"])
+        return kwargs["output_path"]
+
+    def fake_generate_video(**kwargs):
+        image_path = Path(kwargs["image_path"])
+        with Image.open(image_path) as image:
+            image.load()
+            video_first_frames.append(
+                (image_path, image.getpixel((0, 0)))
+            )
+        output_path = Path(kwargs["output_path"])
+        output_path.write_bytes(
+            f"normalized:{output_path.stem}".encode("utf-8")
+        )
+        return str(output_path)
+
+    def fake_normalize(source, output, **kwargs):
+        Path(output).write_bytes(b"normalized:scene_001")
+
+    def fake_probe(_):
+        return VideoInfo(
+            frame_rate=Fraction(24, 1),
+            frame_count=120,
+            duration_seconds=Fraction(5, 1),
+            video_codec="h264",
+            width=1280,
+            height=720,
+            pixel_format="yuv420p",
+            audio_codec=None,
+            audio_sample_rate=None,
+            audio_channels=None,
+        )
+
+    def fake_concatenate(**kwargs):
+        Path(kwargs["output_path"]).write_bytes(b"final")
+
+    monkeypatch.setattr(pipeline, "VIDEO_PROVIDER", "runway")
+    monkeypatch.setattr(pipeline, "generate_scene_image", fake_generate_image)
+    monkeypatch.setattr(
+        pipeline,
+        "generate_scene_image_from_reference",
+        fake_generate_from_reference,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_last_frames",
+        fake_extract_last_frames,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "generate_scene_video",
+        fake_generate_video,
+    )
+    monkeypatch.setattr(pipeline, "probe_video", fake_probe)
+    monkeypatch.setattr(
+        pipeline,
+        "normalize_video_clip",
+        fake_normalize,
+    )
+    monkeypatch.setattr(pipeline, "concatenate_clips", fake_concatenate)
+
+    final_path = pipeline.generate_video_from_storyboard(
+        storyboard,
+        output_dir=tmp_path,
+    )
+
+    scene_one_video = tmp_path / "scene_001.mp4"
+    scene_two_video = tmp_path / "scene_002.mp4"
+    assert extracted_sources == [scene_one_video, scene_two_video]
+    assert [path.read_bytes() for path in extracted_sources] == [
+        b"normalized:scene_001",
+        b"normalized:scene_002",
+    ]
+    assert [pixel for _, pixel in img2img_handoffs] == [
+        (1, 10, 20),
+        (2, 10, 20),
+    ]
+    assert [path for path, _ in img2img_handoffs] == [
+        tmp_path / "scene_001_end_frames" / "frame_000119.png",
+        tmp_path / "scene_002_end_frames" / "frame_000119.png",
+    ]
+    assert [path for path, _ in video_first_frames] == [
+        tmp_path / "scene_001.png",
+        tmp_path / "scene_002.png",
+        tmp_path / "scene_003.png",
+    ]
+    assert [pixel for _, pixel in video_first_frames] == [
+        (1, 1, 1),
+        (21, 30, 40),
+        (22, 30, 40),
+    ]
+    scene_two_diagnostics = json.loads(
+        (tmp_path / "scene_002_generation.json").read_text(encoding="utf-8")
+    )
+    assert scene_two_diagnostics["video_reference_images_submitted"] == []
+    assert scene_two_diagnostics["reference_source_video_path"] == str(
+        scene_one_video
+    )
+    assert scene_two_diagnostics["reference_frame_used_for_img2img"] == str(
+        tmp_path / "scene_001_end_frames" / "frame_000119.png"
+    )
+    assert scene_two_diagnostics["continuity_image_generation_mode"] == "img2img"
+    assert scene_two_diagnostics["first_frame_image_path"] == str(
+        tmp_path / "scene_002.png"
+    )
+    assert final_path.read_bytes() == b"final"

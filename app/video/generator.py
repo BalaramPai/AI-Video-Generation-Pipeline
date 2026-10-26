@@ -58,9 +58,9 @@ def generate_scene_video(
             )
         if reference_images and not provider.capabilities.reference_images:
             logger.info(
-                "Provider does not accept separate reference images; "
-                "the supplied first frame remains the scene conditioning "
-                "image",
+                "Provider does not accept separate reference images; the "
+                "continuity-adjusted first frame is the conditioning image "
+                "sent to the provider",
                 extra={
                     "provider": provider.name,
                     "model": getattr(provider, "_model", None),
@@ -69,6 +69,7 @@ def generate_scene_video(
                     ],
                     "reference_images_submitted": [],
                     "first_frame": str(image),
+                    "first_frame_is_uploaded_conditioning_image": True,
                 },
             )
             reference_images = ()

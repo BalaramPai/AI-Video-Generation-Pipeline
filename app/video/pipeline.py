@@ -1,7 +1,10 @@
 import json
 import logging
+import math
+import re
 from fractions import Fraction
 from pathlib import Path
+from typing import Callable
 
 from app.assets.image_generator import (
     build_scene_negative_prompt,
@@ -53,65 +56,191 @@ def _normalize_state_text(value: str) -> str:
 def _fit_required_motion_prompt(
     components: list[str],
     maximum_characters: int,
-    character_length,
+    character_length: Callable[[str], int],
 ) -> str:
     normalized = [" ".join(component.split()) for component in components]
     if character_length(" ".join(normalized)) <= maximum_characters:
         return " ".join(normalized)
 
-    labeled_components = []
+    labeled_components: list[tuple[str, list[str]]] = []
     for component in normalized:
         label, separator, body = component.partition(":")
         labeled_components.append(
             (f"{label}:" if separator else "", body.strip().split())
         )
 
-    selected_words = [[] for _ in labeled_components]
-    word_indexes = [0 for _ in labeled_components]
+    separator_length = character_length(" ") * (len(labeled_components) - 1)
+    label_length = sum(
+        character_length(label) for label, _ in labeled_components
+    )
+    label_body_separator_length = sum(
+        character_length(" ")
+        for label, words in labeled_components
+        if label and words
+    )
+    content_budget = (
+        maximum_characters
+        - separator_length
+        - label_length
+        - label_body_separator_length
+    )
+    if content_budget <= 0:
+        raise ValueError(
+            "Runway motion prompt cannot fit its required section labels "
+            f"within {maximum_characters} characters."
+        )
 
-    def render() -> str:
-        rendered = []
-        for (label, _), words in zip(
-            labeled_components,
-            selected_words,
-            strict=True,
-        ):
-            if words:
-                rendered.append(" ".join((label, *words)).strip())
-            elif label:
-                rendered.append(label)
-        return " ".join(rendered)
-
-    while True:
-        added_word = False
-        for index, (_, words) in enumerate(labeled_components):
-            if word_indexes[index] >= len(words):
-                continue
-            selected_words[index].append(words[word_indexes[index]])
-            if character_length(render()) <= maximum_characters:
-                word_indexes[index] += 1
-                added_word = True
-            else:
-                selected_words[index].pop()
-        if not added_word:
-            break
-
-    shortened_components = [
-        labeled_components[index][0].rstrip(":") or f"detail {index + 1}"
-        for index, (_, words) in enumerate(labeled_components)
-        if word_indexes[index] < len(words)
+    weights = (0.14, 0.20, 0.18, 0.18, 0.12, 0.05, 0.12, 0.01)
+    budgets = [
+        math.floor(content_budget * weight)
+        for weight in weights[:len(labeled_components)]
     ]
+    for index in range(len(budgets)):
+        budgets[index] += min(
+            content_budget - sum(budgets),
+            1 if sum(budgets) < content_budget else 0,
+        )
+
+    def truncate_at_word_boundary(value: str, budget: int) -> str:
+        if character_length(value) <= budget:
+            return value
+        ellipsis = "..."
+        fitted: list[str] = []
+        for word in value.split():
+            candidate = " ".join((*fitted, word, ellipsis))
+            if character_length(candidate) > budget:
+                break
+            fitted.append(word)
+        if not fitted:
+            return ""
+        return " ".join((*fitted, ellipsis))
+
+    def fit_negative_clauses(value: str, budget: int) -> tuple[str, list[str]]:
+        clauses = [
+            clause.strip()
+            for clause in re.split(r"[,;]", value)
+            if clause.strip()
+        ]
+        clauses = [
+            clause
+            if re.match(r"^(no|not|without|avoid)\b", clause, re.IGNORECASE)
+            else f"No {clause}"
+            for clause in clauses
+        ]
+
+        def priority(clause: str) -> int:
+            normalized_clause = clause.casefold()
+            if any(
+                keyword in normalized_clause
+                for keyword in ("camera", "cut", "transition")
+            ):
+                return 0
+            if any(
+                keyword in normalized_clause
+                for keyword in ("reverse", "upward", "backward", "direction")
+            ):
+                return 1
+            if any(
+                keyword in normalized_clause
+                for keyword in (
+                    "different",
+                    "extra",
+                    "missing",
+                    "rearranged",
+                    "position",
+                    "geometry",
+                    "shape",
+                    "reset",
+                    "teleport",
+                    "layer",
+                )
+            ):
+                return 2
+            return 3
+
+        clauses = [
+            clause
+            for _, clause in sorted(
+                enumerate(clauses),
+                key=lambda item: (priority(item[1]), item[0]),
+            )
+        ]
+        fitted: list[str] = []
+        omitted: list[str] = []
+        for clause in clauses:
+            candidate = "; ".join((*fitted, clause))
+            if character_length(candidate) <= budget:
+                fitted.append(clause)
+            else:
+                omitted.append(clause)
+        return "; ".join(fitted), omitted
+
+    def fit_component(
+        index: int,
+        budget: int,
+    ) -> tuple[str, list[str]]:
+        label, words = labeled_components[index]
+        original = " ".join(words)
+        if label.casefold() == "avoid:":
+            return fit_negative_clauses(original, budget)
+        return truncate_at_word_boundary(original, budget), []
+
+    fitted_contents: list[str] = []
+    omitted_by_component: list[list[str]] = []
+    for index in range(len(labeled_components)):
+        fitted, omitted = fit_component(index, budgets[index])
+        fitted_contents.append(fitted)
+        omitted_by_component.append(omitted)
+
+    unused_budget = content_budget - sum(
+        character_length(content) for content in fitted_contents
+    )
+    for index in range(len(labeled_components)):
+        if unused_budget <= 0:
+            break
+        previous_length = character_length(fitted_contents[index])
+        expanded, omitted = fit_component(
+            index,
+            budgets[index] + unused_budget,
+        )
+        added_characters = (
+            character_length(expanded) - previous_length
+        )
+        if added_characters > 0:
+            budgets[index] += unused_budget
+            fitted_contents[index] = expanded
+            omitted_by_component[index] = omitted
+            unused_budget -= added_characters
+
+    fitted_components: list[str] = []
+    shortened_components: list[str] = []
+    omitted_negative_constraints: list[str] = []
+    for index, (label, words) in enumerate(labeled_components):
+        original = " ".join(words)
+        fitted = fitted_contents[index]
+        omitted_negative_constraints.extend(omitted_by_component[index])
+        if character_length(fitted) < character_length(original):
+            shortened_components.append(label.rstrip(":") or f"detail {index + 1}")
+        fitted_components.append(" ".join(part for part in (label, fitted) if part))
+
+    prompt = " ".join(component for component in fitted_components if component)
+    if character_length(prompt) > maximum_characters:
+        raise ValueError(
+            "Runway motion prompt could not be compacted safely below "
+            f"{maximum_characters} characters."
+        )
     logger.warning(
         "Required Runway prompt content exceeded the provider character "
-        "limit; details were shortened at word boundaries across the "
-        "required sections. Inspect the saved prompt and shorten these "
-        "storyboard fields for best results.",
+        "limit; selected fields were shortened and complete negative "
+        "constraints that did not fit were omitted. Inspect the saved prompt "
+        "and shorten these storyboard fields for best results.",
         extra={
             "shortened_components": shortened_components,
+            "omitted_negative_constraints": omitted_negative_constraints,
             "maximum_characters": maximum_characters,
         },
     )
-    return render()
+    return prompt
 
 
 def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
@@ -122,6 +251,9 @@ def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
     characters = [
         character for character in storyboard.characters
         if character.id in scene.character_ids
+    ]
+    relevant_props = [
+        prop for prop in storyboard.props if prop.id in scene.prop_ids
     ]
     character_lock = "; ".join(
         (
@@ -149,8 +281,13 @@ def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
         f"Identity lock: {character_lock}."
         if character_lock
         else (
-            "Subject lock: preserve the same main subject, design, "
-            "components, and appearance throughout the shot."
+            "Subject lock: same "
+            + (
+                ", ".join(prop.name for prop in relevant_props)
+                if relevant_props
+                else "main subject"
+            )
+            + "; preserve its shape and appearance throughout the shot."
         )
     )
     appearance_instruction = (
@@ -167,11 +304,11 @@ def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
         f"Starting state: {scene.continuity.required_start_state}.",
         f"Action: {scene.action}.",
         f"Ending state: {scene.continuity.ending_state}.",
-        f"Visual: {scene.visual_description}.",
         (
             f"Camera: {scene.camera.shot_type}, {scene.camera.angle}, "
             f"{scene.camera.movement}, {scene.camera.lens or 'natural lens'}."
         ),
+        f"Visual: {scene.visual_description}.",
         f"Avoid: {negative}.",
         "One continuous shot.",
     ]
@@ -231,6 +368,21 @@ def _build_motion_prompt(storyboard: Storyboard, scene: Scene) -> str:
             prompt = candidate
         else:
             omitted_context.append(component.split(":", 1)[0])
+    final_character_count = _utf16_length(prompt)
+    if final_character_count > RUNWAY_PROMPT_MAX_CHARACTERS:
+        raise ValueError(
+            f"{scene.id} assembled motion prompt is "
+            f"{final_character_count} UTF-16 characters; Runway supports "
+            f"{RUNWAY_PROMPT_MAX_CHARACTERS}."
+        )
+    logger.info(
+        "Final assembled Runway motion prompt",
+        extra={
+            "scene_id": scene.id,
+            "character_count": final_character_count,
+            "maximum_characters": RUNWAY_PROMPT_MAX_CHARACTERS,
+        },
+    )
     if omitted_context:
         logger.info(
             "Optional Runway prompt context omitted to preserve the complete "
@@ -399,6 +551,11 @@ def generate_video_from_storyboard(
                 )
             )
             continuity_references = (reference_frames[-1],)
+            diagnostics["reference_source_video_path"] = previous_video
+            diagnostics["reference_frame_used_for_img2img"] = (
+                continuity_references[0]
+            )
+            diagnostics["continuity_image_generation_mode"] = "img2img"
             image_prompt = build_continuity_image_prompt(
                 storyboard=storyboard,
                 scene=scene,

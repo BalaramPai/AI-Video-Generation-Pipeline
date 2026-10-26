@@ -138,11 +138,16 @@ not synthesize narration or render deterministic text labels/overlays.
 These controls reduce, but cannot eliminate, artifacts from the underlying
 video model. Each generated scene image is supplied as the video's starting
 frame; for later scenes the Stable Diffusion img2img pipeline first uses
-frames extracted from the previous clip. Runway image-to-video supports a
-starting image but not a separate last frame or reference-image list; the
-continuity-adjusted starting image is used instead. Keep each scene to one
-primary action, one camera movement, and a small number of characters and
-interacting props.
+verified decoded frames extracted from the normalized previous scene video.
+The extractor clears old frame files, validates image decoding and dimensions,
+and falls back to the nearest earlier valid frame if the clip's final frame
+cannot be used. If no valid reference can be extracted, generation stops.
+Runway image-to-video supports a starting image but not a separate last frame
+or reference-image list; the extracted frame is passed through img2img, and
+that generated continuity image is uploaded as Runway's first-frame input.
+Runway's API request does not contain a separate reference-image field. Keep
+each scene to one primary action, one camera movement, and a small number of
+characters and interacting props.
 
 The optional `VIDEO_PROVIDER=veo` setting keeps the Google Veo provider
 available; it requires `GEMINI_API_KEY` and uses the `VEO_*` settings in
